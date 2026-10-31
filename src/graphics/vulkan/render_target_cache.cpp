@@ -413,6 +413,12 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
       return false;
     }
   }
+  // DP mac port: the two paths render the same frame differently (7e3 is
+  // stored as R16G16B16A16_SFLOAT on host render targets), so say which one.
+  REXGPU_INFO(
+      "VulkanRenderTargetCache: {} path (render_target_path_vulkan \"{}\", FSI {})",
+      path_ == Path::kPixelShaderInterlock ? "fragment shader interlock" : "host render targets",
+      REXCVAR_GET(render_target_path_vulkan), fsi_path_supported ? "supported" : "unsupported");
 
   // Descriptor set layouts.
   VkDescriptorSetLayoutBinding descriptor_set_layout_bindings[2];

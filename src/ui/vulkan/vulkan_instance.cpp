@@ -9,8 +9,10 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -563,6 +565,29 @@ VkBool32 VulkanInstance::DebugUtilsMessengerCallback(
     VkDebugUtilsMessageSeverityFlagBitsEXT message_severity,
     VkDebugUtilsMessageTypeFlagsEXT message_types,
     const VkDebugUtilsMessengerCallbackDataEXT* callback_data, [[maybe_unused]] void* user_data) {
+  // DP mac port: MoltenVK reports this for every pipeline that asks for
+  // primitive restart off (Metal cannot turn it off), dozens per second. Log
+  // the first one only.
+  if (callback_data->pMessage &&
+      std::string_view(callback_data->pMessage)
+              .find("does not support disabling primitive restart") != std::string_view::npos) {
+    static std::atomic<bool> primitive_restart_logged{false};
+    if (primitive_restart_logged.exchange(true)) {
+      return VK_FALSE;
+    }
+    REXGPU_WARN("MoltenVK: Metal cannot disable primitive restart; further reports are suppressed");
+  }
+  // DP mac port: MoltenVK 1.4 also reports this for every color attachment
+  // whose format Metal cannot blend even when blending is off for it. Only the
+  // render target ownership transfer pipelines use integer formats, and they
+  // never blend.
+  if (callback_data->pMessage &&
+      std::string_view(callback_data->pMessage).find("Blending is enabled for attachment") !=
+          std::string_view::npos &&
+      std::string_view(callback_data->pMessage).find("_UINT,") != std::string_view::npos) {
+    return VK_FALSE;
+  }
+
   std::ostringstream log_str;
 
   log_str << "Vulkan " << vk::to_string(vk::DebugUtilsMessageSeverityFlagBitsEXT(message_severity))
