@@ -141,6 +141,10 @@ static const std::unordered_map<std::string, VirtualKey> kKeyNames = {
     {"LMB", VirtualKey::kLButton},
     {"RMB", VirtualKey::kRButton},
     {"MMB", VirtualKey::kMButton},
+    // DP1 port 2026-09-05 (from dpour fork ce7d25d, src/ui/keybinds.cpp)
+    // Mouse wheel (synthetic 1-frame pulses, one per WHEEL_DELTA detent).
+    {"WheelUp", VirtualKey::kWheelUp},
+    {"WheelDown", VirtualKey::kWheelDown},
 };
 
 VirtualKey ParseVirtualKey(std::string_view name) {

@@ -10,6 +10,8 @@
  */
 
 #include <algorithm>
+#include <chrono>
+#include <thread>
 #include <cstdarg>
 #include <cstring>
 #include <sstream>
@@ -1894,6 +1896,7 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  GetD3D12Provider().LogDebugLayerMessages();
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -2045,6 +2048,32 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             frontbuffer_format == xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16;
 
         context.SetIs8bpc(!use_pwl_gamma_ramp && !use_fxaa);
+
+        // [new_fix_24092026] diagnostic: which gamma ramp the emulated path
+        // applies (DP1 native renderer parity). First 4 changes only.
+        {
+          static uint32_t gamma_log_left = 4;
+          static bool logged_once = false;
+          const bool dirty = use_pwl_gamma_ramp ? !gamma_ramp_pwl_up_to_date_
+                                                : !gamma_ramp_256_entry_table_up_to_date_;
+          if (gamma_log_left && (dirty || !logged_once)) {
+            --gamma_log_left;
+            logged_once = true;
+            const reg::DC_LUT_30_COLOR* t = gamma_ramp_256_entry_table();
+            bool identity = true;
+            for (uint32_t i = 0; i < 256; ++i) {
+              const uint32_t v = i * 0x3FF / 0xFF;
+              if (t[i].color_10_red != v || t[i].color_10_green != v || t[i].color_10_blue != v) identity = false;
+            }
+            auto e = [&](uint32_t i) {
+              return fmt::format("[{}]={},{},{}", i, uint32_t(t[i].color_10_red), uint32_t(t[i].color_10_green),
+                                 uint32_t(t[i].color_10_blue));
+            };
+            REXGPU_INFO("DP1 gamma ramp at swap: format {} pwl {} dirty {} table identity {}: {} {} {} {} {} {} {} {}",
+                        uint32_t(frontbuffer_format), use_pwl_gamma_ramp, dirty, identity, e(1), e(8), e(32), e(64),
+                        e(128), e(192), e(254), e(255));
+          }
+        }
 
         // Upload the new gamma ramp, using the upload buffer for the current
         // frame (will close the frame after this anyway, so can't write
@@ -2400,7 +2429,25 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
   if (REXCVAR_GET(async_shader_compilation) &&
       pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
-    return true;
+    // DP1 2026-09-06 (ported from the Downpour SDK fork): the PSO is still
+    // compiling on a background thread. pso_missing_policy=block spin-waits
+    // up to d3d12_pso_block_per_draw_budget_ms for it, so fast compiles never
+    // drop geometry; on timeout (or with policy=skip) the draw is dropped for
+    // this frame only.
+    if (REXCVAR_GET(pso_missing_policy) == "block") {
+      const auto budget = std::chrono::microseconds(
+          static_cast<int64_t>(REXCVAR_GET(d3d12_pso_block_per_draw_budget_ms) * 1000.0));
+      const auto wait_start = std::chrono::steady_clock::now();
+      while (pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+        if (std::chrono::steady_clock::now() - wait_start > budget) {
+          return true;
+        }
+      }
+      // Fall through with the now-ready PSO.
+    } else {
+      return true;
+    }
   }
 
   // Update the textures - this may bind pipelines.
@@ -3215,6 +3262,10 @@ void D3D12CommandProcessor::LogDeviceRemovalDiagnostics(ID3D12Device* device, HR
   }
   REXGPU_ERROR("D3D12 device removed: HRESULT 0x{:08X} - {}", static_cast<unsigned>(reason),
                reason_str);
+  // DP1 (#22): the validation message that caused an INVALID_CALL removal is
+  // produced on the same frame the removal is detected, i.e. after the
+  // per-frame drain - flush both debug queues now, before the game exits.
+  GetD3D12Provider().LogDebugLayerMessages();
 
   Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedData> dred;
   if (FAILED(device->QueryInterface(IID_PPV_ARGS(&dred)))) {

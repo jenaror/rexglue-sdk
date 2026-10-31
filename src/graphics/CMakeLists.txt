@@ -25,6 +25,7 @@ set(REXGPU_XENOS_SOURCES
     pipeline/render_target/cache.cpp
     shared_memory.cpp
     pipeline/texture/cache.cpp
+    pipeline/texture/replacement.cpp
     pipeline/shader/interpreter.cpp
     pipeline/shader/translator.cpp
     pipeline/shader/translator_disasm.cpp
@@ -107,6 +108,7 @@ set_target_properties(rexgpu-xenos PROPERTIES
 
 target_include_directories(rexgpu-xenos PRIVATE
     ${REXGLUE_ROOT}/thirdparty/renderdoc
+    ${REXGLUE_ROOT}/thirdparty/stb  # stb_image.h for texture replacement PNGs
     ${REXGLUE_ROOT}  # For thirdparty/dxbc/DXBCChecksum.h include
 )
 

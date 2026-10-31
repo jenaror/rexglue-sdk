@@ -18,6 +18,10 @@ REXCVAR_DECLARE(bool, vsync);
 REXCVAR_DECLARE(bool, clear_memory_page_state);
 REXCVAR_DECLARE(bool, half_pixel_offset);
 REXCVAR_DECLARE(bool, async_shader_compilation);
+// DP1 (2026-09-06, ported from the Downpour fork): what to do with a draw whose
+// PSO is still compiling on a background thread. Defined in d3d12/pipeline_cache.cpp.
+REXCVAR_DECLARE(std::string, pso_missing_policy);
+REXCVAR_DECLARE(double, d3d12_pso_block_per_draw_budget_ms);
 
 // GPU Resolution / Readback / Queries
 REXCVAR_DECLARE(int32_t, resolution_scale);
@@ -46,6 +50,10 @@ REXCVAR_DECLARE(bool, direct_host_resolve);
 
 // GPU Textures
 REXCVAR_DECLARE(bool, gpu_allow_invalid_fetch_constants);
+REXCVAR_DECLARE(bool, texture_dump);
+REXCVAR_DECLARE(bool, texture_replacement);
+REXCVAR_DECLARE(std::string, texture_path);
+REXCVAR_DECLARE(std::string, texture_trace_hash);
 REXCVAR_DECLARE(bool, gpu_3d_to_2d_texture);
 REXCVAR_DECLARE(int32_t, anisotropic_override);
 REXCVAR_DECLARE(int32_t, texture_cache_memory_limit_render_to_texture);
@@ -65,6 +73,7 @@ REXCVAR_DECLARE(int32_t, primitive_processor_cache_min_indices);
 
 // GPU Debug
 REXCVAR_DECLARE(bool, gpu_debug_markers);
+REXCVAR_DECLARE(bool, gpu_hdr_log);
 bool IsGpuDebugMarkersEnabled();
 
 // GPU Alpha Test

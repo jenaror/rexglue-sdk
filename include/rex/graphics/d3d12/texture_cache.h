@@ -22,6 +22,7 @@
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/d3d12/shared_memory.h>
 #include <rex/graphics/pipeline/texture/cache.h>
+#include <rex/graphics/pipeline/texture/replacement.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/xenos.h>
@@ -268,6 +269,18 @@ class D3D12TextureCache final : public TextureCache {
       srv_descriptors_.emplace(descriptor_key, descriptor_index);
     }
 
+    // Texture replacement (see pipeline/texture/replacement.h): when set,
+    // the resource is R8G8B8A8_UNORM with the image dimensions and
+    // replacement_mip_count() mips, filled from the image instead of guest
+    // memory.
+    const texture_replacement::Image* replacement() const { return replacement_; }
+    uint32_t replacement_mip_count() const { return replacement_mip_count_; }
+    void SetReplacement(const texture_replacement::Image* image, uint32_t mip_count) {
+      replacement_ = image;
+      replacement_mip_count_ = mip_count;
+    }
+    Microsoft::WRL::ComPtr<ID3D12Resource>& replacement_upload() { return replacement_upload_; }
+
    private:
     Microsoft::WRL::ComPtr<ID3D12Resource> resource_;
     D3D12_RESOURCE_STATES resource_state_;
@@ -278,7 +291,13 @@ class D3D12TextureCache final : public TextureCache {
     // according to profiling, was often a bottleneck in many games).
     // For bindless - indices in the global shader-visible descriptor heap.
     std::unordered_map<SRVDescriptorKey, uint32_t, SRVDescriptorKey::Hasher> srv_descriptors_;
+
+    const texture_replacement::Image* replacement_ = nullptr;
+    uint32_t replacement_mip_count_ = 0;
+    Microsoft::WRL::ComPtr<ID3D12Resource> replacement_upload_;
   };
+
+  bool UploadReplacementTexture(D3D12Texture& texture);
 
   static constexpr uint32_t kSRVDescriptorCachePageSize = 65536;
 

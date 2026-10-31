@@ -17,12 +17,14 @@
 #include <rex/input/flags.h>
 #include <rex/input/input_driver.h>
 #include <rex/input/input_system.h>
+#include <rex/input/state_filter.h>
 #include <rex/input/mnk/mnk_input_driver.h>
 #include <rex/input/nop/nop_input_driver.h>
 #include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/input/state_merge.h>
 #include <rex/input/xinput/xinput_input_driver.h>
 #include <rex/logging.h>
+#include <rex/system/kernel_state.h>  // [new_fix_28092026_upstream]
 
 REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput")
     .allowed({"sdl", "xinput"});
@@ -212,8 +214,66 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
   return driver->GetDeviceCapabilities(chosen, flags, out_caps);
 }
 
+// [new_fix_28092026_upstream] port of upstream 3cd7243 (the parts DP needs).
+// XN_SYS_INPUTDEVICESCHANGED: titles re-check their pads on it, so a pad
+// plugged in or woken up mid-game is noticed.
+constexpr uint32_t kXNotificationSystemInputDevicesChanged = 0x00000012;
+
 X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   SCOPE_profile_cpu_f("hid");
+  X_INPUT_STATE state = {};
+  const X_RESULT result = ReadMergedState(user_index, &state);
+  NoteConnection(user_index, result == X_ERROR_SUCCESS);
+  if (result != X_ERROR_SUCCESS) {
+    return result;
+  }
+  if (ui_input_blockers_.load(std::memory_order_acquire) > 0) {
+    state.gamepad = X_INPUT_GAMEPAD{};  // a dialog owns the input
+  } else {
+    std::lock_guard<std::mutex> lock(gate_mutex_);
+    state.gamepad.buttons = gate_.Mask(user_index, uint16_t(state.gamepad.buttons));
+  }
+  if (out_state) {
+    *out_state = state;
+  }
+  return X_ERROR_SUCCESS;
+}
+
+void InputSystem::NoteConnection(uint32_t user_index, bool connected) {
+  GuestInputGate::Change change;
+  {
+    std::lock_guard<std::mutex> lock(gate_mutex_);
+    change = gate_.Observe(user_index, connected);
+  }
+  if (change == GuestInputGate::Change::kNone) {
+    return;
+  }
+  REXLOG_INFO("Input: controller {} guest user {}; notifying the game (XN_SYS_INPUTDEVICESCHANGED)",
+              change == GuestInputGate::Change::kConnected ? "connected to" : "disconnected from",
+              user_index);
+  if (auto* kernel_state = REX_KERNEL_STATE()) {
+    kernel_state->BroadcastNotification(kXNotificationSystemInputDevicesChanged, 0);
+  }
+}
+
+void InputSystem::AddUIInputBlocker() {
+  ui_input_blockers_.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void InputSystem::RemoveUIInputBlocker() {
+  // Whatever is held now (the press that closed the dialog) stays hidden from
+  // the game until released.
+  for (uint32_t user_index = 0; user_index < kMaxGuestUsers; ++user_index) {
+    X_INPUT_STATE state = {};
+    if (ReadMergedState(user_index, &state) == X_ERROR_SUCCESS) {
+      std::lock_guard<std::mutex> lock(gate_mutex_);
+      gate_.Consume(user_index, uint16_t(state.gamepad.buttons));
+    }
+  }
+  ui_input_blockers_.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+X_RESULT InputSystem::ReadMergedState(uint32_t user_index, X_INPUT_STATE* out_state) {
   if (!assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
@@ -234,6 +294,9 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
       continue;
     }
     active_devices_.Observe(user_index, id, state.gamepad);
+    // DP1 2026-09-14 (#19): title-side per-device remap (rex/input/state_filter.h).
+    const DeviceInfo* info = DeviceInfoFor(id);
+    ApplyStateFilter(user_index, info ? info->synthetic : false, state.gamepad);
     if (!any) {
       merged = state;
       any = true;
@@ -245,6 +308,8 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   if (!any) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
+  // DP1 2026-09-14 (#19): synthetic presses on the merged state.
+  ApplyInjectedButtons(user_index, merged.gamepad);
   if (out_state) {
     *out_state = merged;
   }

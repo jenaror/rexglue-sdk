@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -17,6 +18,7 @@
 #include <rex/audio/conversion.h>
 #include <rex/audio/downmix.h>
 #include <rex/audio/flags.h>
+#include <rex/audio/output_layout.h>
 #include <rex/audio/sdl/sdl_audio_driver.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
@@ -25,6 +27,12 @@
 #include <SDL3/SDL.h>
 
 REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
+// DPRecomp #19 (2026-09-20): the endpoint's channel count is not always the
+// truth (Windows set to 5.1, stereo speakers behind it: the dialogue's center
+// channel plays nowhere). Let the user pick the layout.
+REXCVAR_DEFINE_STRING(audio_channels, "auto", "Audio",
+                      "Output layout: auto (follow the Windows endpoint), stereo (always fold "
+                      "5.1 to 2.0 in the runtime), surround (always submit 6 channels)");
 
 namespace rex::audio::sdl {
 
@@ -75,11 +83,14 @@ bool SDLAudioDriver::Initialize() {
 
   // A 1-channel device gets the stereo fold too, then SDL collapses to mono.
   // Handing it a 6ch stream instead would use SDL's own downmix.
-  if (obtained_spec.channels <= 2) {
+  // audio_channels overrules the endpoint (see output_layout.h).
+  const OutputLayout layout = ParseOutputLayout(REXCVAR_GET(audio_channels));
+  const uint8_t submit_channels = ResolveOutputChannels(layout, obtained_spec.channels);
+  if (submit_channels != sdl_device_channels_) {
     SDL_DestroyAudioStream(sdl_stream_);
     sdl_stream_ = nullptr;
-    desired_spec.channels = 2;
-    sdl_device_channels_ = 2;
+    desired_spec.channels = submit_channels;
+    sdl_device_channels_ = submit_channels;
     sdl_stream_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &desired_spec,
                                             SDLCallback, this);
     if (!sdl_stream_) {
@@ -97,9 +108,10 @@ bool SDLAudioDriver::Initialize() {
   // first thing worth knowing when a report says the balance is wrong on one
   // speaker setup and right on another.
   const char* device_name = SDL_GetAudioDeviceName(sdl_device);
-  REXAPU_INFO("audio endpoint '{}': {} ch, {} Hz, format 0x{:04X}; submitting {} ch",
+  REXAPU_INFO("audio endpoint '{}': {} ch, {} Hz, format 0x{:04X}; submitting {} ch (audio_channels {})",
               device_name ? device_name : "?", obtained_spec.channels, obtained_spec.freq,
-              static_cast<uint32_t>(obtained_spec.format), static_cast<int>(sdl_device_channels_));
+              static_cast<uint32_t>(obtained_spec.format), static_cast<int>(sdl_device_channels_),
+              REXCVAR_GET(audio_channels));
 
   if (!SDL_ResumeAudioDevice(sdl_device)) {
     REXAPU_ERROR("SDL_ResumeAudioDevice() failed: {}", SDL_GetError());
@@ -178,6 +190,26 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
   const StereoFold fold = GetStereoFold();
   const SurroundMix mix = GetSurroundMix();
   const float gain = GetOutputGain();
+  // Underrun accounting (DP1 #12 diagnostics): every silence fill delays the
+  // guest audio stream by one frame relative to real time, so report them.
+  {
+    using clock = std::chrono::steady_clock;
+    static clock::time_point last_report = clock::now();
+    static uint32_t fills_since_report = 0, silence_since_report = 0;
+    ++fills_since_report;
+    const clock::time_point now = clock::now();
+    if (now - last_report >= std::chrono::seconds(10)) {
+      if (silence_since_report) {
+        REXLOG_WARN("SDLAudioDriver: {} silence fills out of {} device pulls in the last 10 s",
+                    silence_since_report, fills_since_report);
+      }
+      last_report = now;
+      fills_since_report = 0;
+      silence_since_report = 0;
+    }
+    std::unique_lock<std::mutex> guard(driver->frames_mutex_);
+    if (driver->frames_queued_.empty()) ++silence_since_report;
+  }
   while (additional_amount > 0) {
     static uint32_t sdl_callback_count = 0;
     std::unique_lock<std::mutex> guard(driver->frames_mutex_);

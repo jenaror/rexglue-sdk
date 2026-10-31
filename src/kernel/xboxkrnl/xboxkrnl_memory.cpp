@@ -173,6 +173,9 @@ u32 NtAllocateVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_si
   }
   if (!address) {
     // Failed - assume no memory available.
+    REXKRNL_WARN("[NtAllocateVirtualMemory] FAILED: size={:#x} type={:#x} protect={:#x} - "
+                 "guest virtual heap exhausted?",
+                 adjusted_size, alloc_type, protect);
     return X_STATUS_NO_MEMORY;
   }
 
@@ -400,6 +403,9 @@ u32 MmAllocatePhysicalMemoryEx_entry(u32 flags, u32 region_size, u32 protect_bit
   if (!heap->AllocRange(heap_min_addr, heap_max_addr, adjusted_size, adjusted_alignment,
                         allocation_type, protect, top_down, &base_address)) {
     // Failed - assume no memory available.
+    REXKRNL_WARN("[MmAllocatePhysicalMemoryEx] FAILED: size={:#x} align={:#x} page={:#x} - "
+                 "guest physical heap exhausted?",
+                 adjusted_size, adjusted_alignment, page_size);
     return 0;
   }
   REXKRNL_IMPORT_RESULT("MmAllocatePhysicalMemoryEx", "addr={:#x}", base_address);

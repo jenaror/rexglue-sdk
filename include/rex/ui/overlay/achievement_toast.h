@@ -11,6 +11,7 @@
  */
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <deque>
 #include <mutex>
@@ -35,6 +36,12 @@ class AchievementToastDialog : public AchievementNotificationDialog {
   // Thread-safe: safe to call from any thread, including guest threads.
   void Push(const rex::system::AchievementEvent& event) override;
 
+  // [new_fix_27092026_i36] Repaint continuously only while a toast is queued
+  // or on screen; an idle toast dialog kept the UI presenting every refresh.
+  bool WantsContinuousRepaint() const override {
+    return has_toast_.load(std::memory_order_relaxed);
+  }
+
  protected:
   void OnDraw(ImGuiIO& io) override;
 
@@ -49,6 +56,7 @@ class AchievementToastDialog : public AchievementNotificationDialog {
 
   std::mutex mutex_;
   std::deque<PendingToast> queue_;
+  std::atomic<bool> has_toast_{false};  // [new_fix_27092026_i36] !queue_.empty()
   AchievementIconCache icon_cache_;
 };
 

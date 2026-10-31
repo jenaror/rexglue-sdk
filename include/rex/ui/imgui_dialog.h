@@ -52,6 +52,14 @@ class ImGuiDialog {
   virtual void OnClose() {}
   virtual void OnDraw(ImGuiIO& io) { (void)io; }
 
+ public:
+  // [new_fix_27092026_i36] Whether the drawer should keep repainting on every
+  // monitor refresh for this dialog (animation, input). A dialog that is
+  // currently drawing nothing returns false; while no dialog wants it, the UI
+  // is only drawn with the guest's own frames (one present per game frame,
+  // DPRecomp #36). Declared last so existing vtable slots keep their order.
+  virtual bool WantsContinuousRepaint() const { return true; }
+
  private:
   ImGuiDrawer* imgui_drawer_ = nullptr;
   bool has_close_pending_ = false;

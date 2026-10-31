@@ -15,6 +15,16 @@
 
 REXCVAR_DEFINE_BOOL(gpu_allow_invalid_fetch_constants, false, "GPU",
                     "Allow invalid fetch constants");
+// DP1 (2026-09-06): guest texture dump / host texture replacement.
+REXCVAR_DEFINE_BOOL(texture_dump, false, "GPU",
+                    "Write every 2D texture the game loads as PNG into <texture_path>/dump");
+REXCVAR_DEFINE_BOOL(texture_replacement, true, "GPU",
+                    "Replace guest textures with <texture_path>/<hash>.png when present");
+REXCVAR_DEFINE_STRING(texture_trace_hash, "", "GPU",
+                      "Diagnostics: 16-hex texture hash; every draw binding it logs the blend / alpha "
+                      "test / colour mask registers once per distinct state");
+REXCVAR_DEFINE_STRING(texture_path, "", "GPU",
+                      "Texture dump/replacement folder (empty = \"textures\" next to the executable)");
 REXCVAR_DEFINE_BOOL(native_2x_msaa, true, "GPU", "Enable native 2x MSAA");
 REXCVAR_DEFINE_BOOL(depth_float24_round, false, "GPU", "Round float24 depth values");
 REXCVAR_DEFINE_BOOL(depth_float24_convert_in_pixel_shader, false, "GPU",
@@ -28,6 +38,10 @@ REXCVAR_DEFINE_STRING(dump_shaders, "", "GPU", "Path to dump shaders to");
 REXCVAR_DEFINE_BOOL(use_fuzzy_alpha_epsilon, false, "GPU",
                     "Use approximate compare for alpha test values to prevent "
                     "flickering on NVIDIA graphics cards");
+REXCVAR_DEFINE_BOOL(gpu_hdr_log, true, "GPU",
+                    "Log once per distinct case: EDRAM resolves (source render target format, "
+                    "destination texture format, exponent bias, number format) and texture fetch "
+                    "constants with gamma signs, exponent adjust or float formats (DPRecomp HDR audit)");
 REXCVAR_DEFINE_BOOL(gpu_debug_markers, false, "GPU",
                     "Insert debug markers into GPU command streams for tools "
                     "like PIX and RenderDoc. Automatically enabled when "

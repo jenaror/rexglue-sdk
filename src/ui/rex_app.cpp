@@ -14,6 +14,7 @@
 #include <cstdlib>
 
 #include <rex/assert.h>
+#include <rex/crash_handler.h>
 #include <rex/cvar.h>
 #include <rex/ui/flags.h>
 #include <rex/kernel/crt/heap.h>
@@ -25,6 +26,8 @@
 #include <rex/ui/overlay/console_overlay.h>
 #include <rex/ui/overlay/debug_overlay.h>
 #include <rex/ui/overlay/settings_overlay.h>
+#include <rex/ui/overlay/pso_compile_indicator_state.h>
+#include <rex/ui/overlay/shader_compile_overlay.h>
 #include <rex/audio/audio_system.h>
 #include <rex/audio/sdl/sdl_audio_system.h>
 #include <rex/input/input_system.h>
@@ -34,6 +37,8 @@
 #include <rex/system/achievement_manager.h>
 #include <rex/system/gpu_plugin.h>
 #include <rex/system/kernel_state.h>
+#include <rex/stats.h>
+#include <rex/perf/counter.h>
 #include <rex/system/xthread.h>
 #include <rex/ui/graphics_provider.h>
 #include <rex/ui/keybinds.h>
@@ -173,6 +178,21 @@ bool ReXApp::SetupEnvironment() {
 
   rex::InitLogging(log_config);
   rex::RegisterLogLevelCallback();
+  rex::crash::Install((exe_dir / "logs").string(), std::string(GetName()));
+  rex::system::RegisterGuestCrashInfo();
+  rex::stats::StartPeriodicLogging();
+  // DP1 2026-09-14: the Tracy client is built in but was never started, and
+  // the per-frame counter CSV had no caller. Both stay off by default.
+#ifdef REXGLUE_ENABLE_PROFILING
+  if (REXCVAR_GET(tracy_enable)) {
+    rex::perf::Profiler::Startup();
+    REXLOG_INFO("Tracy profiler started (tracy_enable); waiting for a capture on port 8086");
+  }
+  if (!REXCVAR_GET(perf_log_csv).empty()) {
+    rex::perf::SetCsvLogPath(REXCVAR_GET(perf_log_csv));
+    REXLOG_INFO("Per-frame perf CSV: {}", REXCVAR_GET(perf_log_csv));
+  }
+#endif
 
   log_sink_ = std::make_shared<rex::LogCaptureSink>();
   rex::AddSink(log_sink_);
@@ -394,6 +414,11 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
   // gated eager font upload in SetImmediateDrawer is skipped (font uploads
   // lazily on the first Draw instead).
   imgui_drawer_->SetPresenterAndImmediateDrawer(presenter, drawer);
+  // DP1 v1.1: PSO compile indicator (self-gates on show_shader_compile_indicator).
+  if (!pso_compile_indicator_overlay_) {
+    pso_compile_indicator_overlay_ =
+        std::make_unique<ui::PsoCompileIndicatorDialog>(imgui_drawer_.get());
+  }
   rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle debug overlay", [this] {
     if (debug_overlay_) {
       debug_overlay_.reset();
@@ -457,25 +482,60 @@ void ReXApp::LaunchModule() {
     }
 
     auto* graphics_system = runtime_->graphics_system();
-    if (graphics_system && !runtime_->cache_root().empty()) {
-      uint32_t title_id = runtime_->kernel_state()->title_id();
-      if (title_id != 0) {
-        REXLOG_INFO("Initializing shader storage for title {:08X}...", title_id);
-        graphics_system->InitializeShaderStorage(runtime_->cache_root(), title_id, true);
-      }
+    const uint32_t title_id =
+        runtime_->kernel_state() ? runtime_->kernel_state()->title_id() : 0;
+    const bool has_shader_storage =
+        graphics_system && !runtime_->cache_root().empty() && title_id != 0;
+    if (!has_shader_storage) {
+      FinishModuleLaunch(std::move(main_thread));
+      return;
+    }
+    REXLOG_INFO("Initializing shader storage for title {:08X}...", title_id);
+
+    // DP1 v1.1 (Downpour port): run the blocking storage replay on a worker
+    // thread and keep the UI thread pumping so a "Pipelines N / M" toast is
+    // visible instead of a frozen window; the toast resumes the guest main
+    // thread once the replay has finished.
+    if (imgui_drawer_) {
+      auto& progress = rex::graphics::d3d12::PsoCompileIndicatorStateRef();
+      progress.storage_finished.store(false, std::memory_order_release);
+      progress.storage_shaders_translated.store(0, std::memory_order_relaxed);
+      progress.storage_pipelines_total.store(0, std::memory_order_relaxed);
+      progress.storage_pipelines_created.store(0, std::memory_order_relaxed);
+      auto cache_root = runtime_->cache_root();
+      auto main_thread_shared =
+          std::make_shared<system::object_ref<system::XThread>>(std::move(main_thread));
+      // Owned by the drawer's dialog list; deleted after Close().
+      new rex::ui::ShaderCompileDialog(
+          imgui_drawer_.get(), "Preparing shaders",
+          "Warming the pipeline cache; only the first launch after an update takes a while.",
+          [this, main_thread_shared]() mutable {
+            FinishModuleLaunch(std::move(*main_thread_shared));
+          });
+      std::thread([graphics_system, cache_root = std::move(cache_root), title_id]() {
+        graphics_system->InitializeShaderStorage(cache_root, title_id, true);
+        rex::graphics::d3d12::PsoCompileIndicatorStateRef().storage_finished.store(
+            true, std::memory_order_release);
+      }).detach();
+      return;
     }
 
-    OnPostLaunchModule(main_thread.get());
-    main_thread->Resume();
+    graphics_system->InitializeShaderStorage(runtime_->cache_root(), title_id, true);
+    FinishModuleLaunch(std::move(main_thread));
+  });
+}
 
-    module_thread_ = std::thread([this, main_thread = std::move(main_thread)]() mutable {
-      main_thread->Wait(0, 0, 0, nullptr);
-      OnGuestThreadExit(main_thread.get());
-      REXLOG_INFO("Execution complete");
-      if (!shutting_down_.load(std::memory_order_acquire)) {
-        app_context().CallInUIThread([this]() { app_context().QuitFromUIThread(); });
-      }
-    });
+void ReXApp::FinishModuleLaunch(system::object_ref<system::XThread> main_thread) {
+  OnPostLaunchModule(main_thread.get());
+  main_thread->Resume();
+
+  module_thread_ = std::thread([this, main_thread = std::move(main_thread)]() mutable {
+    main_thread->Wait(0, 0, 0, nullptr);
+    OnGuestThreadExit(main_thread.get());
+    REXLOG_INFO("Execution complete");
+    if (!shutting_down_.load(std::memory_order_acquire)) {
+      app_context().CallInUIThread([this]() { app_context().QuitFromUIThread(); });
+    }
   });
 }
 

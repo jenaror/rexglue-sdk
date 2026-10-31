@@ -28,6 +28,7 @@
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/mmio_handler.h>
 #include <rex/system/xmemory.h>
+#include <rex/stats.h>
 #include <rex/thread.h>
 
 // TODO(benvanik): move xbox.h out
@@ -102,6 +103,8 @@ Memory::Memory() {
 Memory::~Memory() {
   assert_true(active_memory_ == this);
   active_memory_ = nullptr;
+
+  rex::stats::UnregisterProvider("heaps");
 
   // Uninstall the MMIO handler, as we won't be able to service more requests.
   mmio_handler_.reset();
@@ -232,6 +235,12 @@ bool Memory::Initialize() {
     return false;
   }
   REXSYS_DEBUG("Installed MMIO handler for physical address translation");
+
+  // DP1 2026-09-13: guest heap usage in the periodic [stats] line. Reads the
+  // page counters without the heap mutex on purpose: the stats thread must
+  // keep reporting while a guest thread is stuck inside an allocation, and a
+  // stale 32-bit counter is harmless for a diagnostic.
+  rex::stats::RegisterProvider("heaps", [this]() { return DescribeHeapUsage(); });
 
   // ?
   uint32_t unk_phys_alloc;
@@ -783,6 +792,30 @@ bool Memory::Restore(stream::ByteStream* stream) {
 //=============================================================================
 // Recompiled Code Function Table
 //=============================================================================
+
+std::string Memory::DescribeHeapUsage() const {
+  struct Entry {
+    const char* label;
+    const BaseHeap* heap;
+  };
+  const Entry entries[] = {
+      {"v00", &heaps_.v00000000}, {"v40", &heaps_.v40000000}, {"v80", &heaps_.v80000000},
+      {"v90", &heaps_.v90000000}, {"vA0", &heaps_.vA0000000}, {"vC0", &heaps_.vC0000000},
+      {"vE0", &heaps_.vE0000000}, {"phys", &heaps_.physical},
+  };
+  std::string out;
+  for (const Entry& entry : entries) {
+    const uint64_t page_size = entry.heap->page_size();
+    const uint64_t total = uint64_t(entry.heap->total_page_count()) * page_size;
+    const uint64_t reserved = uint64_t(entry.heap->reserved_page_count()) * page_size;
+    if (!out.empty()) {
+      out += ' ';
+    }
+    fmt::format_to(std::back_inserter(out), "{} {}/{}", entry.label, reserved >> 20, total >> 20);
+  }
+  out += " MB";
+  return out;
+}
 
 bool Memory::InitializeFunctionTable(uint32_t code_base, uint32_t code_size, uint32_t image_base,
                                      uint32_t image_size) {

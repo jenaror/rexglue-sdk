@@ -10,12 +10,17 @@
  *              See LICENSE file in the project root for full license text.
  */
 #pragma once
+#include <string_view>
 #include <rex/ui/imgui_dialog.h>
 #include <array>
 #include <cstdint>
 #include <functional>
 
 namespace rex::ui {
+
+// DP1 2026-09-06: lets the app replace the SDK build stamp watermark shown by the
+// debug overlay (F3) with its own build string. Empty = REXGLUE_BUILD_STAMP.
+void SetDebugOverlayBuildStamp(std::string_view stamp);
 
 struct FrameStats {
   double frame_time_ms = 0;

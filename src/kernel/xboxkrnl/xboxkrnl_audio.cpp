@@ -52,7 +52,7 @@ u32 XAudioEnableDucker_entry(u32 unk) {
 }
 
 u32 XAudioRegisterRenderDriverClient_entry(mapped_u32 callback_ptr, mapped_u32 driver_ptr) {
-  REXKRNL_DEBUG("XAudioRegisterRenderDriverClient called! callback_ptr={:08X} driver_ptr={:08X}",
+  REXKRNL_INFO("XAudioRegisterRenderDriverClient: callback={:08X} driver={:08X}",
                 callback_ptr.guest_address(), driver_ptr.guest_address());
   if (!callback_ptr) {
     return X_E_INVALIDARG;

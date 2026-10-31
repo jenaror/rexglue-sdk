@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <cfloat>
 #include <cstring>
 #include <filesystem>
@@ -436,7 +437,14 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   // it now if needed.
   DetachIfLastDialogRemoved();
 
-  if (!dialogs_.empty()) {
+  // [new_fix_27092026_i36] Only while some dialog wants it: an always-present
+  // but invisible dialog (the PSO compile indicator) made the UI thread present
+  // on every monitor refresh on top of the guest's frames (PresentMon: 60 game
+  // frames -> 239 presents/s at 180 Hz, "119 FPS" on a 60 Hz monitor).
+  const bool wants_repaint =
+      std::any_of(dialogs_.cbegin(), dialogs_.cend(),
+                  [](const ImGuiDialog* dialog) { return dialog->WantsContinuousRepaint(); });
+  if (wants_repaint) {
     // Repaint (and handle input) continuously if still active. In detached mode
     // there is no presenter; the app drives repaint via its own present loop.
     if (presenter_) {

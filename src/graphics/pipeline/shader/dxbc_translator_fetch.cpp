@@ -10,6 +10,9 @@
  */
 
 #include <algorithm>
+#include <cstdlib>
+#include <string>
+#include <vector>
 #include <cmath>
 #include <memory>
 #include <sstream>
@@ -26,6 +29,52 @@
 
 REXCVAR_DEFINE_BOOL(draw_resolution_scaled_texture_offsets, true, "GPU/Shader",
                     "Scale texture offsets with draw resolution");
+// DP1 2026-09-06: at draw resolution scale > 1, screen-space post-process
+// passes (bloom / DoF blurs) keep their tap spacing in guest texels, so every
+// bilinear tap lands on a single host texel and the texels in between are
+// skipped - a regular grid appears on hair, foliage and glow (Deadly
+// Premonition). Shifting the coordinates of resolution-scaled (resolved)
+// textures by half a host texel turns each tap into an exact 2x2 host-texel
+// box average, i.e. the pass sees the same image it saw at 1x.
+REXCVAR_DEFINE_BOOL(gpu_resolved_texture_box_filter, false, "GPU/Shader",
+                    "Sample resolution-scaled render-target textures with a 2x2 host-texel box "
+                    "(half-texel shift) so guest-texel-spaced post-process taps do not alias")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// Applying the shift to every resolved-texture fetch also turns the final 1:1
+// scene copy into a 2x2 average (the whole frame drops to 1x), so it is
+// limited to the listed pixel shaders (ucode hashes, hex, comma-separated).
+// Default (Deadly Premonition): 17-tap separable blur 2124BC7D, 2x2 box
+// downsample 46331D61, 4-tap shadow PCF FA55491D. NOT the 3-tap full-screen
+// passes (FF5A2E8B chromatic split, 1530E2EB) - those run 1:1 and would soften
+// the whole frame.
+REXCVAR_DEFINE_STRING(gpu_resolved_texture_box_filter_shaders,
+                      "2124BC7DB86884DF,46331D613EE9AA78,FA55491D7925E74A,1530E2EB5CFF039B,FF5A2E8BBD6623F6",
+                      "GPU/Shader",
+                      "Pixel shader ucode hashes (hex, comma-separated) that get the resolved "
+                      "texture 2x2 box shift")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+namespace {
+bool IsBoxFilterShader(uint64_t ucode_hash) {
+  static const std::vector<uint64_t> hashes = [] {
+    std::vector<uint64_t> result;
+    const std::string& list = REXCVAR_GET(gpu_resolved_texture_box_filter_shaders);
+    size_t pos = 0;
+    while (pos < list.size()) {
+      size_t end = list.find_first_of(", ;", pos);
+      if (end == std::string::npos) {
+        end = list.size();
+      }
+      if (end > pos) {
+        result.push_back(std::strtoull(list.substr(pos, end - pos).c_str(), nullptr, 16));
+      }
+      pos = end + 1;
+    }
+    return result;
+  }();
+  return std::find(hashes.begin(), hashes.end(), ucode_hash) != hashes.end();
+}
+}  // namespace
 
 namespace rex::graphics {
 using namespace ucode;
@@ -834,6 +883,18 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
     // the texture is 3D unconditionally.
     size_needed_components |= 0b1000;
   }
+  // DP1: 2x2 host-texel box shift for resolution-scaled textures (see the
+  // gpu_resolved_texture_box_filter cvar) - needs the texture size.
+  const bool resolved_box_shift =
+      REXCVAR_GET(gpu_resolved_texture_box_filter) && is_pixel_shader() &&
+      IsBoxFilterShader(current_shader().ucode_data_hash()) &&
+      instr.opcode == FetchOpcode::kTextureFetch &&
+      instr.dimension == xenos::FetchOpDimension::k2D &&
+      !instr.attributes.unnormalized_coordinates &&
+      (draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1);
+  if (resolved_box_shift) {
+    size_needed_components |= 0b0011;
+  }
   uint32_t size_and_is_3d_temp = size_needed_components ? PushSystemTemp() : UINT32_MAX;
   if (size_needed_components) {
     switch (instr.dimension) {
@@ -1144,6 +1205,25 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
                     dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kZZZZ));
         }
       }
+    }
+    if (resolved_box_shift) {
+      // DP1: if this fetch slot is a resolution-scaled texture, shift the
+      // normalized XY by half a HOST texel (= 0.5 / (guest size * scale)).
+      uint32_t shift_temp = PushSystemTemp();
+      a_.OpAnd(dxbc::Dest::R(shift_temp, 0b1000),
+               LoadSystemConstant(SystemConstants::Index::kTexturesResolutionScaled,
+                                  offsetof(SystemConstants, textures_resolution_scaled),
+                                  dxbc::Src::kXXXX),
+               dxbc::Src::LU(uint32_t(1) << tfetch_index));
+      a_.OpIf(true, dxbc::Src::R(shift_temp, dxbc::Src::kWWWW));
+      a_.OpDiv(dxbc::Dest::R(shift_temp, 0b0011),
+               dxbc::Src::LF(0.5f / float(draw_resolution_scale_x_),
+                             0.5f / float(draw_resolution_scale_y_), 0.0f, 0.0f),
+               dxbc::Src::R(size_and_is_3d_temp));
+      a_.OpAdd(dxbc::Dest::R(coord_and_sampler_temp, 0b0011),
+               dxbc::Src::R(coord_and_sampler_temp), dxbc::Src::R(shift_temp));
+      a_.OpEndIf();
+      PopSystemTemp();
     }
     switch (instr.dimension) {
       case xenos::FetchOpDimension::k1D:

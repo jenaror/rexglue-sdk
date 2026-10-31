@@ -9,11 +9,14 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
+
 #include <rex/audio/xma/context.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
+#include <rex/stats.h>
 #include <rex/perf/counter.h>
 #include <rex/math.h>
 #include <rex/memory/ring_buffer.h>
@@ -203,6 +206,9 @@ int XmaDecoder::GetContextId(uint32_t guest_ptr) {
   return (guest_ptr - context_data_first_ptr_) >> 6;
 }
 
+// DP1 2026-09-13: live XMA context count for the periodic [stats] line.
+static std::atomic<int64_t> g_xma_contexts_in_use{0};
+
 uint32_t XmaDecoder::AllocateContext() {
   size_t index = context_bitmap_.Acquire();
   if (index == -1) {
@@ -213,6 +219,7 @@ uint32_t XmaDecoder::AllocateContext() {
   XmaContext& context = contexts_[index];
   assert_false(context.is_allocated());
   context.set_is_allocated(true);
+  rex::stats::Set("audio/xma_contexts", g_xma_contexts_in_use.fetch_add(1) + 1);
   return context.guest_ptr();
 }
 
@@ -224,6 +231,7 @@ void XmaDecoder::ReleaseContext(uint32_t guest_ptr) {
   assert_true(context.is_allocated());
   context.Release();
   context_bitmap_.Release(context_id);
+  rex::stats::Set("audio/xma_contexts", g_xma_contexts_in_use.fetch_sub(1) - 1);
 }
 
 bool XmaDecoder::BlockOnContext(uint32_t guest_ptr, bool poll) {

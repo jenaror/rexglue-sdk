@@ -142,6 +142,13 @@ u32 ExCreateThread_entry(mapped_u32 handle_ptr, u32 stack_size, mapped_u32 threa
   auto thread = object_ref<XThread>(new XThread(
       REX_KERNEL_STATE(), actual_stack_size, xapi_thread_startup, start_address.guest_address(),
       start_context.guest_address(), creation_flags, true, false, guest_process));
+  {
+    // DP1 diagnostics: name announced by the game's thread wrapper hook, if any.
+    std::string pending = XThread::TakePendingGuestThreadName();
+    if (!pending.empty()) {
+      thread->set_name(pending);
+    }
+  }
 
   X_STATUS result = thread->Create();
   if (XFAILED(result)) {

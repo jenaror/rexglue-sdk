@@ -848,6 +848,7 @@ void XexModule::ReadSecurityInfo() {
     security_info_.load_address = xex1_sec_info->load_address;
     security_info_.page_descriptor_count = xex1_sec_info->page_descriptor_count;
     security_info_.page_descriptors = xex1_sec_info->page_descriptors;
+    security_info_.region = xex1_sec_info->region;
   } else if (xex_format_ == kFormatXex2) {
     const xex2_security_info* xex2_sec_info =
         reinterpret_cast<const xex2_security_info*>(GetSecurityInfo(xex_header()));
@@ -860,6 +861,7 @@ void XexModule::ReadSecurityInfo() {
     security_info_.load_address = xex2_sec_info->load_address;
     security_info_.page_descriptor_count = xex2_sec_info->page_descriptor_count;
     security_info_.page_descriptors = xex2_sec_info->page_descriptors;
+    security_info_.region = xex2_sec_info->region;
   }
 }
 

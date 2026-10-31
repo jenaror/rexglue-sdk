@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
 #include <string>
 
 #include <fmt/format.h>
@@ -27,6 +28,7 @@
 #include <rex/kernel/xboxkrnl/threading.h>
 #include <rex/system/kernel_module.h>
 #include <rex/system/kernel_state.h>
+#include <rex/stats.h>
 #include <rex/system/function_dispatcher.h>
 #include <chrono>
 #include <thread>
@@ -73,6 +75,27 @@ KernelState::KernelState(Runtime* emulator)
     user_data_root = std::filesystem::absolute(user_data_root);
   }
   content_manager_ = std::make_unique<xam::ContentManager>(this, user_data_root);
+
+  // DP1 2026-09-13: kernel object / guest thread counts in the periodic
+  // [stats] line. try_lock only: a hung guest thread may hold the global
+  // critical region, and the line must keep coming then.
+  rex::stats::RegisterProvider("kernel", [this]() {
+    std::string out;
+    uint32_t objects = 0;
+    if (object_table_.TryCountObjects(&objects)) {
+      out = fmt::format("objects {}", objects);
+    } else {
+      out = "objects busy";
+    }
+    std::unique_lock<std::recursive_mutex> lock(thread::global_critical_region::mutex(),
+                                                std::try_to_lock);
+    if (lock.owns_lock()) {
+      fmt::format_to(std::back_inserter(out), " threads {}", threads_by_id_.size());
+    } else {
+      out += " threads busy";
+    }
+    return out;
+  });
 
   if (shared_kernel_state_ != nullptr) {
     REXSYS_ERROR("KernelState constructed but shared_kernel_state_ already set");
@@ -161,6 +184,7 @@ void KernelState::SetProcessTLSVars(X_KPROCESS* process, uint32_t num_slots, uin
 }
 
 KernelState::~KernelState() {
+  rex::stats::UnregisterProvider("kernel");
   app_manager_.reset();
 
   // Stop the dispatch thread before touching the object table

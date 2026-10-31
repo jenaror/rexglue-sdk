@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <unordered_set>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -1106,6 +1107,30 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
                : xenos::GetColorRenderTargetFormatName(
                      xenos::ColorRenderTargetFormat(color_edram_info.format)),
       dest_format_info.name, rb_copy_dest_base, copy_dest_extent_start, copy_dest_extent_end);
+
+  // DP1 2026-09-14 (HDR audit): one line per distinct resolve configuration.
+  if (REXCVAR_GET(gpu_hdr_log)) {
+    static std::unordered_set<uint64_t> reported;
+    const uint32_t src_format = is_depth ? depth_edram_info.format : color_edram_info.format;
+    const uint64_t key = (uint64_t(is_depth) << 63) | (uint64_t(src_format) << 56) |
+                         (uint64_t(uint32_t(dest_format)) << 48) |
+                         (uint64_t(uint32_t(exp_bias) & 63) << 40) |
+                         (uint64_t(uint32_t(rb_copy_dest_info.copy_dest_number)) << 36) |
+                         (uint64_t(rb_copy_dest_info.copy_dest_swap) << 35) |
+                         (uint64_t(uint32_t(x1 - x0) & 0xFFFF) << 16) | uint64_t(uint32_t(y1 - y0) & 0xFFFF);
+    if (reported.insert(key).second) {
+      REXGPU_INFO(
+          "HDR resolve: {} {}x{} -> texture {} at 0x{:08X}, exp_bias {}, number_format {}, "
+          "swap {}, clear {}/{} (first seen; gpu_hdr_log)",
+          is_depth ? xenos::GetDepthRenderTargetFormatName(
+                         xenos::DepthRenderTargetFormat(depth_edram_info.format))
+                   : xenos::GetColorRenderTargetFormatName(
+                         xenos::ColorRenderTargetFormat(color_edram_info.format)),
+          x1 - x0, y1 - y0, dest_format_info.name, rb_copy_dest_base, exp_bias,
+          uint32_t(rb_copy_dest_info.copy_dest_number), uint32_t(rb_copy_dest_info.copy_dest_swap),
+          uint32_t(rb_copy_control.color_clear_enable), uint32_t(rb_copy_control.depth_clear_enable));
+    }
+  }
 
   return true;
 }

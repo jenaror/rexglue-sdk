@@ -15,6 +15,8 @@
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/string.h>
+#include <rex/cvar.h>
+#include <rex/system/flags.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
 #include <rex/system/xenumerator.h>
@@ -174,7 +176,36 @@ u32 XGetAVPack_entry() {
   return 6;
 }
 
+// DP1 2026-09-18 (DPRecomp #27): XGetGameRegion returns the console's game
+// region code (XC_GAME_REGION_*: 0x00FF North America, 0x0101 Japan, 0x0201
+// China, 0x02FE / 0x02FF Europe), not the XEX region flags. The old fixed
+// 0xFFFF is what a development kit reports, and Deadly Premonition's European
+// build only honours the console language for a retail region (it accepts
+// exactly 0x00FF, 0x0101, 0x0201, 0x02FE, 0x02FF, PAL sub_8223CAD0), so with
+// 0xFFFF the launcher's Game Language never took effect. The code is derived
+// from the running XEX's region flags; game_region overrides it.
+REXCVAR_DEFINE_UINT32(game_region, 0, "Kernel",
+                      "Console game region reported by XGetGameRegion (0x00FF North America, 0x0101 "
+                      "Japan, 0x0201 China, 0x02FF Europe, 0xFFFF development kit); 0 = derive it "
+                      "from the region flags of the running XEX");
+
 uint32_t xeXGetGameRegion() {
+  const uint32_t override_region = REXCVAR_GET(game_region);
+  if (override_region != 0) {
+    return override_region & 0xFFFFu;
+  }
+  auto module = REX_KERNEL_STATE() ? REX_KERNEL_STATE()->GetExecutableModule() : nullptr;
+  if (module && module->xex_module() && module->xex_module()->loaded()) {
+    const uint32_t flags = module->xex_module()->xex_security_info()->region;
+    if (flags == XEX_REGION_ALL || flags == 0) {
+      return 0x00FFu;  // region-free image: behave like a North American console
+    }
+    if (flags & XEX_REGION_PAL) return 0x02FFu;
+    if (flags & XEX_REGION_NTSCU) return 0x00FFu;
+    if (flags & XEX_REGION_NTSCJ_JAPAN) return 0x0101u;
+    if (flags & XEX_REGION_NTSCJ_CHINA) return 0x0201u;
+    if (flags & XEX_REGION_NTSCJ) return 0x0101u;
+  }
   return 0xFFFFu;
 }
 
@@ -183,19 +214,17 @@ u32 XGetGameRegion_entry() {
 }
 
 u32 XGetLanguage_entry() {
-  auto desired_language = XLanguage::kEnglish;
-
-  // Switch the language based on game region.
-  // TODO(benvanik): pull from xex header.
-  uint32_t game_region = XEX_REGION_NTSCU;
-  if (game_region & XEX_REGION_NTSCU) {
-    desired_language = XLanguage::kEnglish;
-  } else if (game_region & XEX_REGION_NTSCJ) {
-    desired_language = XLanguage::kJapanese;
+  // DP1 2026-09-18 (DPRecomp #27): the legacy no-argument XGetLanguage is the
+  // one Deadly Premonition (and other XDK-era titles) call to pick their text
+  // language; it used to be a Xenia-era stub that always answered English, so
+  // the user_language cvar (XamGetLanguage / the launcher's Game Language)
+  // never reached those games. Serve the same value XamGetLanguage serves,
+  // with the stub's English fallback for an invalid setting.
+  const uint32_t language = REXCVAR_GET(user_language);
+  if (language == uint32_t(XLanguage::kInvalid) || language >= uint32_t(XLanguage::kMaxLanguages)) {
+    return uint32_t(XLanguage::kEnglish);
   }
-  // Add more overrides?
-
-  return uint32_t(desired_language);
+  return language;
 }
 
 u32 XamGetCurrentTitleId_entry() {

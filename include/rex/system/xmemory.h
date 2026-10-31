@@ -541,6 +541,10 @@ class Memory {
   // Dumps a map of all allocated memory to the log.
   void DumpMap();
 
+  // One-line reserved/total summary of every guest heap, in MB, for the
+  // periodic [stats] line. Lock-free (see the provider registration).
+  std::string DescribeHeapUsage() const;
+
   bool Save(stream::ByteStream* stream);
   bool Restore(stream::ByteStream* stream);
 

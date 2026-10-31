@@ -24,6 +24,25 @@ namespace rex::input::mnk {
 
 void SetMouseLookActive(bool active);
 bool IsMouseLookActive();
+// DP1 2026-09-06: direct camera control. While active, mouse motion is NOT
+// mapped to the right stick; instead the app drains the raw deltas (pixels
+// since the last call) from a game-side hook and applies them to the camera
+// angles itself.
+void SetMouseCameraHookActive(bool active);
+bool IsMouseCameraHookActive();
+void TakeMouseCameraDelta(float& dx_out, float& dy_out);
+// DP1 v1.1.1: true while the camera hook has drained the delta within the
+// last ~200 ms, i.e. a gameplay camera is running. In menus / the map the
+// camera routines do not run, so the mouse falls back to the right stick
+// (map zoom and the like) instead of banking a camera snap.
+bool IsMouseCameraHookRecent();
+// DP1 v1.1 (DPRecomp #11): the aim camera of the game (PAL sub_8233B3C0) is
+// driven by the LEFT stick and keeps its own velocity model, so the camera
+// hook cannot steer it. A game hook calls NoteMouseAimFrame() every frame the
+// aim camera runs; while that is fresh, GetState maps the mouse onto the left
+// stick (the game's native aim input) instead of feeding the camera hook.
+void NoteMouseAimFrame();
+bool IsMouseAimStickActive();
 
 class MnkInputDriver final : public InputDriver,
                              public rex::ui::WindowInputListener,
@@ -50,6 +69,8 @@ class MnkInputDriver final : public InputDriver,
   void OnMouseDown(rex::ui::MouseEvent& e) override;
   void OnMouseUp(rex::ui::MouseEvent& e) override;
   void OnMouseMove(rex::ui::MouseEvent& e) override;
+  // DP1 port 2026-09-05 (from dpour fork ce7d25d, mnk_input_driver.h)
+  void OnMouseWheel(rex::ui::MouseEvent& e) override;
 
   // WindowListener
   void OnClosing(rex::ui::UIEvent& e) override;
@@ -75,12 +96,23 @@ class MnkInputDriver final : public InputDriver,
 
   std::mutex state_mutex_;
   bool key_down_[256] = {};
+  // Keys that went down since the last GetState poll (a tap shorter than a
+  // poll interval is otherwise invisible). Cleared by GetState.
+  bool key_pressed_since_poll_[256] = {};
 
   // Mouse delta tracking. Fractional because relative motion arrives in
   // fractions of a pixel, and truncating each event drops slow movement.
   // Filled on the UI thread, drained on the guest thread, hence the lock.
   float mouse_dx_ = 0.0f;
   float mouse_dy_ = 0.0f;
+
+  // DP1 port 2026-09-05 (from dpour fork ce7d25d, mnk_input_driver.h)
+  // Vertical mouse-wheel accumulator (MouseEvent::kScrollPerDetent units,
+  // 120 per detent). Filled by OnMouseWheel on the UI thread, drained one
+  // detent per GetDeviceState poll on the guest thread (under state_mutex_),
+  // pulsing kWheelUp / kWheelDown for exactly one poll so the wheel can be
+  // bound to any controller button ("WheelUp" / "WheelDown").
+  int32_t wheel_accumulator_y_ = 0;
 
   // UI thread only.
   int32_t prev_mouse_x_ = 0;

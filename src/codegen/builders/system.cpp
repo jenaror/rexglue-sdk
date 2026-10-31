@@ -98,7 +98,7 @@ bool build_twi(BuilderContext& ctx) {
   // twi 31, r0, <imm> is an unconditional trap with service code in the immediate
   if (to == 0x1F && ra == 0) {
     uint16_t trap_type = static_cast<uint16_t>(simm);
-    ctx.println("\tppc_trap(ctx, base, {});", trap_type);
+    ctx.println("\tppc_trap(ctx, base, {}, 0x{:08X});", trap_type, ctx.base);
     return true;
   }
 

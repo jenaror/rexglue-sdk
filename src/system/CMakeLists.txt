@@ -8,6 +8,7 @@ set(REXSYSTEM_SOURCES
     kernel_module.cpp
     user_module.cpp
     xthread.cpp
+    guest_crash_info.cpp
     xevent.cpp
     xfile.cpp
     xmutant.cpp
@@ -30,6 +31,7 @@ set(REXSYSTEM_SOURCES
 
     # XAM services
     xam/app_manager.cpp
+    xam/content_dir_ops.cpp
     xam/content_manager.cpp
     xam/user_profile.cpp
 

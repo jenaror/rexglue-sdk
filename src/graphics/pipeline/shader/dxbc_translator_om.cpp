@@ -1136,14 +1136,22 @@ void DxbcShaderTranslator::ROV_UnpackColor(uint32_t rt_index, uint32_t packed_te
   a_.OpCase(dxbc::Src::LU(RenderTargetCache::AddPSIColorFormatFlags(
       xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16)));
   {
-    // Unpack the alpha.
-    a_.OpUBFE(dxbc::Dest::R(color_temp, 0b1000), dxbc::Src::LU(2), dxbc::Src::LU(30),
-              packed_temp_low);
+    // DP1 shadow alpha (LittleBitUA, 2026-09-07): the EDRAM buffer has a
+    // second half holding, for every 32bpp sample written as 7e3, a dword with
+    // the 16-bit UNORM alpha in the low half and a 16-bit tag of the main
+    // dword in the high half. The caller loads and validates it (falling back
+    // to the 2-bit alpha of the main dword when the tag doesn't match) into the
+    // high packed component, so the alpha is read from there instead of the
+    // 2 bits, keeping the smooth alpha masks the game writes to its HDR scene
+    // (sky / composite mask contours in Deadly Premonition).
+    a_.OpAnd(dxbc::Dest::R(color_temp, 0b1000),
+             dxbc::Src::R(packed_temp).Select(packed_temp_components + 1),
+             dxbc::Src::LU(0xFFFF));
     // Convert the alpha from fixed-point.
     a_.OpUToF(dxbc::Dest::R(color_temp, 0b1000), dxbc::Src::R(color_temp, dxbc::Src::kWWWW));
     // Normalize the alpha.
     a_.OpMul(dxbc::Dest::R(color_temp, 0b1000), dxbc::Src::R(color_temp, dxbc::Src::kWWWW),
-             dxbc::Src::LF(1.0f / 3.0f));
+             dxbc::Src::LF(1.0f / 65535.0f));
     // Process the components in reverse order because color_temp.r stores the
     // packed color which shouldn't be touched until G and B are converted if
     // packed_temp and color_temp are the same.
@@ -1305,6 +1313,12 @@ void DxbcShaderTranslator::ROV_PackPreClampedColor(uint32_t rt_index, uint32_t c
     a_.OpFToU(temp1_dest, temp1_src);
     // Pack the alpha.
     a_.OpBFI(packed_dest_low, dxbc::Src::LU(2), dxbc::Src::LU(30), temp1_src, packed_src_low);
+    // DP1 shadow alpha: 16-bit UNORM alpha for the shadow dword in the high
+    // packed component (the tag is inserted right before storing, from the
+    // final masked main dword).
+    a_.OpMAd(temp1_dest, dxbc::Src::R(color_temp, dxbc::Src::kWWWW), dxbc::Src::LF(65535.0f),
+             dxbc::Src::LF(0.5f));
+    a_.OpFToU(dxbc::Dest::R(packed_temp, 1 << (packed_temp_components + 1)), temp1_src);
   }
   a_.OpBreak();
 
@@ -2096,9 +2110,85 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
         // The color is 32bpp.
         a_.OpElse();
         {
-          // Break register dependency in temp.w if the color is 32bpp.
-          // temp.zw = packed destination color/alpha.
-          a_.OpMov(temp_w_dest, dxbc::Src::LU(0));
+          // DP1 shadow alpha: for 7e3 render targets, load the shadow dword
+          // of the sample and validate it against the main dword - the tag
+          // (low 16 bits XOR high 16 bits of the main dword) must match, and
+          // the 16-bit alpha must quantize to the 2-bit alpha stored in the
+          // main dword. Stale shadows (the sample was overwritten as depth,
+          // 8888, cleared...) fail the check and the exact 2-bit alpha is used
+          // instead, so no tile tracking is needed. The validated 16-bit
+          // alpha is left in temp.w for ROV_UnpackColor and for keeping.
+          // temp.w = whether the format is 7e3.
+          a_.OpIEq(temp_w_dest, rt_format_flags_src,
+                   dxbc::Src::LU(RenderTargetCache::AddPSIColorFormatFlags(
+                       xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT)));
+          uint32_t shadow_temp = PushSystemTemp();
+          a_.OpIEq(dxbc::Dest::R(shadow_temp, 0b0001), rt_format_flags_src,
+                   dxbc::Src::LU(RenderTargetCache::AddPSIColorFormatFlags(
+                       xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16)));
+          a_.OpOr(temp_w_dest, temp_w_src, dxbc::Src::R(shadow_temp, dxbc::Src::kXXXX));
+          // temp.w = free.
+          a_.OpIf(true, temp_w_src);
+          {
+            // shadow_temp.x = shadow dword address.
+            a_.OpIAdd(dxbc::Dest::R(shadow_temp, 0b0001),
+                      dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
+                      dxbc::Src::LU(edram_size_32bpp_samples));
+            // temp.w = shadow dword.
+            a_.OpLdUAVTyped(
+                temp_w_dest, dxbc::Src::R(shadow_temp, dxbc::Src::kXXXX), 1,
+                dxbc::Src::U(uav_index_edram_, uint32_t(UAVRegister::kEdram), dxbc::Src::kXXXX));
+            // shadow_temp.x = tag of the main dword.
+            a_.OpUShR(dxbc::Dest::R(shadow_temp, 0b0001), temp_z_src, dxbc::Src::LU(16));
+            a_.OpXOr(dxbc::Dest::R(shadow_temp, 0b0001),
+                     dxbc::Src::R(shadow_temp, dxbc::Src::kXXXX), temp_z_src);
+            a_.OpAnd(dxbc::Dest::R(shadow_temp, 0b0001),
+                     dxbc::Src::R(shadow_temp, dxbc::Src::kXXXX), dxbc::Src::LU(0xFFFF));
+            // shadow_temp.y = tag stored in the shadow dword.
+            a_.OpUShR(dxbc::Dest::R(shadow_temp, 0b0010), temp_w_src, dxbc::Src::LU(16));
+            // shadow_temp.x = whether the tags match.
+            a_.OpIEq(dxbc::Dest::R(shadow_temp, 0b0001),
+                     dxbc::Src::R(shadow_temp, dxbc::Src::kXXXX),
+                     dxbc::Src::R(shadow_temp, dxbc::Src::kYYYY));
+            // shadow_temp.y = 16-bit alpha from the shadow dword.
+            a_.OpAnd(dxbc::Dest::R(shadow_temp, 0b0010), temp_w_src, dxbc::Src::LU(0xFFFF));
+            // shadow_temp.z = the 16-bit alpha quantized to 2 bits
+            // ((a * 3 + 32767) / 65535, same rounding as the packing).
+            a_.OpUMAd(dxbc::Dest::R(shadow_temp, 0b0100),
+                      dxbc::Src::R(shadow_temp, dxbc::Src::kYYYY), dxbc::Src::LU(3),
+                      dxbc::Src::LU(32767));
+            a_.OpUDiv(dxbc::Dest::R(shadow_temp, 0b0100), dxbc::Dest::Null(),
+                      dxbc::Src::R(shadow_temp, dxbc::Src::kZZZZ), dxbc::Src::LU(65535));
+            // shadow_temp.w = 2-bit alpha of the main dword.
+            a_.OpUShR(dxbc::Dest::R(shadow_temp, 0b1000), temp_z_src, dxbc::Src::LU(30));
+            // shadow_temp.z = whether the quantized alphas match.
+            a_.OpIEq(dxbc::Dest::R(shadow_temp, 0b0100),
+                     dxbc::Src::R(shadow_temp, dxbc::Src::kZZZZ),
+                     dxbc::Src::R(shadow_temp, dxbc::Src::kWWWW));
+            // shadow_temp.x = whether the shadow dword is valid.
+            a_.OpAnd(dxbc::Dest::R(shadow_temp, 0b0001),
+                     dxbc::Src::R(shadow_temp, dxbc::Src::kXXXX),
+                     dxbc::Src::R(shadow_temp, dxbc::Src::kZZZZ));
+            // shadow_temp.w = fallback 16-bit alpha from the 2-bit alpha
+            // (0, 1, 2, 3 -> 0, 21845, 43690, 65535).
+            a_.OpUMul(dxbc::Dest::Null(), dxbc::Dest::R(shadow_temp, 0b1000),
+                      dxbc::Src::R(shadow_temp, dxbc::Src::kWWWW), dxbc::Src::LU(21845));
+            // temp.w = validated 16-bit alpha.
+            a_.OpMovC(temp_w_dest, dxbc::Src::R(shadow_temp, dxbc::Src::kXXXX),
+                      dxbc::Src::R(shadow_temp, dxbc::Src::kYYYY),
+                      dxbc::Src::R(shadow_temp, dxbc::Src::kWWWW));
+          }
+          // The color is not 7e3.
+          a_.OpElse();
+          {
+            // Break register dependency in temp.w if the color is 32bpp.
+            // temp.zw = packed destination color/alpha.
+            a_.OpMov(temp_w_dest, dxbc::Src::LU(0));
+          }
+          // Close the 7e3 check.
+          a_.OpEndIf();
+          // Release shadow_temp.
+          PopSystemTemp();
         }
         // Close the color format check.
         a_.OpEndIf();
@@ -2577,6 +2667,39 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
         }
         a_.OpStoreUAVTyped(dxbc::Dest::U(uav_index_edram_, uint32_t(UAVRegister::kEdram)),
                            temp_z_src, 1, temp_y_src);
+      }
+      // The color is 32bpp.
+      a_.OpElse();
+      {
+        // DP1 shadow alpha: for 7e3 render targets, store the shadow dword
+        // (see the previous color load above): the 16-bit alpha packed by
+        // ROV_PackPreClampedColor (or kept from the validated old shadow via
+        // the high keep mask) in the low half of temp.y, the tag of the final
+        // main dword in the high half.
+        // temp.z = whether the format is 7e3.
+        a_.OpIEq(temp_z_dest, rt_format_flags_src,
+                 dxbc::Src::LU(RenderTargetCache::AddPSIColorFormatFlags(
+                     xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT)));
+        a_.OpIEq(temp_w_dest, rt_format_flags_src,
+                 dxbc::Src::LU(RenderTargetCache::AddPSIColorFormatFlags(
+                     xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16)));
+        a_.OpOr(temp_z_dest, temp_z_src, temp_w_src);
+        // temp.z = free.
+        a_.OpIf(true, temp_z_src);
+        {
+          // temp.z = tag of the final main dword (low 16 bits used).
+          a_.OpUShR(temp_z_dest, temp_x_src, dxbc::Src::LU(16));
+          a_.OpXOr(temp_z_dest, temp_z_src, temp_x_src);
+          // temp.y = shadow dword.
+          a_.OpBFI(temp_y_dest, dxbc::Src::LU(16), dxbc::Src::LU(16), temp_z_src, temp_y_src);
+          // temp.z = shadow dword address.
+          a_.OpIAdd(temp_z_dest, dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
+                    dxbc::Src::LU(edram_size_32bpp_samples));
+          a_.OpStoreUAVTyped(dxbc::Dest::U(uav_index_edram_, uint32_t(UAVRegister::kEdram)),
+                             temp_z_src, 1, temp_y_src);
+        }
+        // Close the 7e3 check.
+        a_.OpEndIf();
       }
       // Close the 64bpp conditional.
       a_.OpEndIf();

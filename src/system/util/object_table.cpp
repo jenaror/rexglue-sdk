@@ -15,6 +15,9 @@
 #include <rex/logging.h>
 #include <rex/stream.h>
 #include <rex/system/util/object_table.h>
+#include <mutex>
+
+#include <rex/thread/mutex.h>
 #include <rex/system/xobject.h>
 #include <rex/system/xthread.h>
 
@@ -227,6 +230,24 @@ std::vector<object_ref<XObject>> ObjectTable::GetAllObjects() {
   }
 
   return results;
+}
+
+bool ObjectTable::TryCountObjects(uint32_t* out_count) {
+  std::unique_lock<std::recursive_mutex> lock(thread::global_critical_region::mutex(),
+                                              std::try_to_lock);
+  if (!lock.owns_lock()) {
+    return false;
+  }
+  uint32_t count = 0;
+  for (uint32_t slot = 0; slot < table_capacity_; ++slot) {
+    if (table_[slot].object != nullptr) {
+      ++count;
+    }
+  }
+  if (out_count) {
+    *out_count = count;
+  }
+  return true;
 }
 
 void ObjectTable::PurgeAllObjects() {

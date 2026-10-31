@@ -42,6 +42,14 @@ enum class VirtualKey : uint16_t {
   kBack = 0x08,  // Backspace.
   kTab = 0x09,
 
+  // DP1 port 2026-09-05 (from dpour fork ce7d25d, include/rex/ui/virtual_key.h)
+  // Synthetic pulse keys used by MnK to expose vertical mouse-wheel scroll
+  // as bindable buttons (one logical "press" per WHEEL_DELTA detent of 120).
+  // These never come from real keyboard events; 0x0A/0x0B are unassigned in
+  // the Win32 VK table.
+  kWheelUp = 0x0A,
+  kWheelDown = 0x0B,
+
   kClear = 0x0C,
   kReturn = 0x0D,  // Enter.
 

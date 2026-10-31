@@ -11,8 +11,16 @@
 
 #include <cstdlib>
 
+#include <mutex>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
+#include <fmt/format.h>
+
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/crash_handler.h>
+#include <rex/stats.h>
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_immediate_drawer.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
@@ -21,6 +29,10 @@
 #include <malloc.h>
 
 REXCVAR_DEFINE_BOOL(d3d12_debug, false, "UI/D3D12", "Enable Direct3D 12 and DXGI debug layer")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(d3d12_dred, true, "UI/D3D12",
+                    "Enable DRED (auto-breadcrumbs and page-fault data) so a device removal "
+                    "is explained in the log even without the debug layer")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_BOOL(d3d12_break_on_error, false, "UI/D3D12",
@@ -65,6 +77,10 @@ std::unique_ptr<D3D12Provider> D3D12Provider::Create() {
 }
 
 D3D12Provider::~D3D12Provider() {
+  rex::stats::UnregisterProvider("vram");
+  if (dxgi_adapter3_ != nullptr) {
+    dxgi_adapter3_->Release();
+  }
   if (graphics_analysis_ != nullptr) {
     graphics_analysis_->Release();
   }
@@ -228,18 +244,18 @@ bool D3D12Provider::Initialize() {
       debug = false;
     }
 
-    // Enable DRED (Device Removed Extended Data) for diagnosing GPU crashes.
-    {
-      Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dred_settings;
-      if (SUCCEEDED(pfn_d3d12_get_debug_interface_(IID_PPV_ARGS(&dred_settings)))) {
-        dred_settings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-        dred_settings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-        REXLOG_INFO("DRED (Device Removed Extended Data) enabled");
-      } else {
-        REXLOG_WARN(
-            "Failed to enable DRED - device removal diagnostics will be "
-            "limited");
-      }
+  }
+  // Enable DRED (Device Removed Extended Data) for diagnosing GPU crashes.
+  // DP1 (2026-09-13): on by default, independent of the debug layer, so a
+  // player's log carries the breadcrumbs of a device removal (#22).
+  if (debug || REXCVAR_GET(d3d12_dred)) {
+    Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dred_settings;
+    if (SUCCEEDED(pfn_d3d12_get_debug_interface_(IID_PPV_ARGS(&dred_settings)))) {
+      dred_settings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+      dred_settings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+      REXLOG_INFO("DRED (Device Removed Extended Data) enabled");
+    } else {
+      REXLOG_WARN("Failed to enable DRED - device removal diagnostics will be limited");
     }
   }
   // Create the DXGI factory.
@@ -351,7 +367,19 @@ bool D3D12Provider::Initialize() {
     if (REXCVAR_GET(d3d12_break_on_warning)) {
       d3d12_info_queue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, TRUE);
     }
-    d3d12_info_queue->Release();
+    if (debug) {
+      // Kept for LogDebugLayerMessages(): the stored messages are drained into
+      // the log once per frame, so players can enable d3d12_debug and attach
+      // the log without a debugger attached.
+      debug_info_queue_ = d3d12_info_queue;
+      // The DXGI side (swap chain, present) has its own queue.
+      if (pfn_dxgi_get_debug_interface1_ &&
+          FAILED(pfn_dxgi_get_debug_interface1_(0, IID_PPV_ARGS(&dxgi_debug_info_queue_)))) {
+        dxgi_debug_info_queue_ = nullptr;
+      }
+    } else {
+      d3d12_info_queue->Release();
+    }
   }
 
   // Create the command queue for graphics.
@@ -396,6 +424,33 @@ bool D3D12Provider::Initialize() {
   dxgi_factory_ = dxgi_factory;
   device_ = device;
   direct_queue_ = direct_queue;
+
+  // DP1 2026-09-13: VRAM budget / usage for the periodic [stats] line.
+  // QueryVideoMemoryInfo is thread-safe, so the stats thread calls it directly.
+  {
+    Microsoft::WRL::ComPtr<IDXGIFactory4> dxgi_factory4;
+    IDXGIAdapter3* adapter3 = nullptr;
+    if (SUCCEEDED(dxgi_factory->QueryInterface(IID_PPV_ARGS(&dxgi_factory4))) &&
+        SUCCEEDED(dxgi_factory4->EnumAdapterByLuid(device->GetAdapterLuid(),
+                                                   IID_PPV_ARGS(&adapter3)))) {
+      dxgi_adapter3_ = adapter3;
+      rex::stats::RegisterProvider("vram", [adapter3]() {
+        DXGI_QUERY_VIDEO_MEMORY_INFO local = {};
+        DXGI_QUERY_VIDEO_MEMORY_INFO non_local = {};
+        std::string out;
+        if (SUCCEEDED(adapter3->QueryVideoMemoryInfo(
+                0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local))) {
+          out = fmt::format("local {}/{} MB", local.CurrentUsage >> 20, local.Budget >> 20);
+        }
+        if (SUCCEEDED(adapter3->QueryVideoMemoryInfo(
+                0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &non_local))) {
+          fmt::format_to(std::back_inserter(out), "{}shared {}/{} MB", out.empty() ? "" : " ",
+                         non_local.CurrentUsage >> 20, non_local.Budget >> 20);
+        }
+        return out;
+      });
+    }
+  }
 
   // Get descriptor sizes for each type.
   for (uint32_t i = 0; i < D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES; ++i) {
@@ -474,6 +529,97 @@ std::unique_ptr<Presenter> D3D12Provider::CreatePresenter(
 
 std::unique_ptr<ImmediateDrawer> D3D12Provider::CreateImmediateDrawer() {
   return D3D12ImmediateDrawer::Create(*this);
+}
+
+void D3D12Provider::LogDebugLayerMessages() const {
+  // Once per frame: make sure nothing replaced the crash handler's filter.
+  rex::crash::Reassert();
+  static std::mutex mutex;
+  static std::unordered_map<int, uint32_t> seen;
+  std::lock_guard<std::mutex> lock(mutex);
+  std::vector<uint8_t> buffer;
+
+  // DXGI queue first: a swap-chain / present rejection that removes the device
+  // lands here, not in the D3D12 queue.
+  if (dxgi_debug_info_queue_) {
+    const UINT64 dxgi_count = dxgi_debug_info_queue_->GetNumStoredMessages(DXGI_DEBUG_ALL);
+    for (UINT64 i = 0; i < dxgi_count; ++i) {
+      SIZE_T length = 0;
+      if (FAILED(dxgi_debug_info_queue_->GetMessage(DXGI_DEBUG_ALL, i, nullptr, &length)) ||
+          !length) {
+        continue;
+      }
+      buffer.resize(length);
+      DXGI_INFO_QUEUE_MESSAGE* message = reinterpret_cast<DXGI_INFO_QUEUE_MESSAGE*>(buffer.data());
+      if (FAILED(dxgi_debug_info_queue_->GetMessage(DXGI_DEBUG_ALL, i, message, &length))) {
+        continue;
+      }
+      if (message->Severity == DXGI_INFO_QUEUE_MESSAGE_SEVERITY_INFO ||
+          message->Severity == DXGI_INFO_QUEUE_MESSAGE_SEVERITY_MESSAGE) {
+        continue;
+      }
+      uint32_t& times = seen[0x40000000 | static_cast<int>(message->ID)];
+      ++times;
+      if (times > 5 && (times % 500) != 0) {
+        continue;
+      }
+      std::string_view text(message->pDescription,
+                            message->DescriptionByteLength ? message->DescriptionByteLength - 1 : 0);
+      if (message->Severity <= DXGI_INFO_QUEUE_MESSAGE_SEVERITY_ERROR) {
+        REXLOG_ERROR("DXGI debug layer [id {} x{}]: {}", static_cast<int>(message->ID), times, text);
+      } else {
+        REXLOG_WARN("DXGI debug layer [id {} x{}]: {}", static_cast<int>(message->ID), times, text);
+      }
+    }
+    if (dxgi_count) {
+      dxgi_debug_info_queue_->ClearStoredMessages(DXGI_DEBUG_ALL);
+    }
+  }
+
+  if (!debug_info_queue_) {
+    return;
+  }
+  const UINT64 count = debug_info_queue_->GetNumStoredMessages();
+  if (!count) {
+    return;
+  }
+  for (UINT64 i = 0; i < count; ++i) {
+    SIZE_T length = 0;
+    if (FAILED(debug_info_queue_->GetMessage(i, nullptr, &length)) || !length) {
+      continue;
+    }
+    buffer.resize(length);
+    D3D12_MESSAGE* message = reinterpret_cast<D3D12_MESSAGE*>(buffer.data());
+    if (FAILED(debug_info_queue_->GetMessage(i, message, &length))) {
+      continue;
+    }
+    uint32_t& times = seen[static_cast<int>(message->ID)];
+    ++times;
+    // The first 5 of each message ID verbatim, then every 500th, so a warning
+    // that fires every frame cannot fill the log.
+    if (times > 5 && (times % 500) != 0) {
+      continue;
+    }
+    std::string_view text(message->pDescription, message->DescriptionByteLength
+                                                       ? message->DescriptionByteLength - 1
+                                                       : 0);
+    switch (message->Severity) {
+      case D3D12_MESSAGE_SEVERITY_CORRUPTION:
+      case D3D12_MESSAGE_SEVERITY_ERROR:
+        REXLOG_ERROR("D3D12 debug layer [id {} x{}]: {}", static_cast<int>(message->ID), times,
+                     text);
+        break;
+      case D3D12_MESSAGE_SEVERITY_WARNING:
+        REXLOG_WARN("D3D12 debug layer [id {} x{}]: {}", static_cast<int>(message->ID), times,
+                    text);
+        break;
+      default:
+        REXLOG_INFO("D3D12 debug layer [id {} x{}]: {}", static_cast<int>(message->ID), times,
+                    text);
+        break;
+    }
+  }
+  debug_info_queue_->ClearStoredMessages();
 }
 
 }  // namespace rex::ui::d3d12

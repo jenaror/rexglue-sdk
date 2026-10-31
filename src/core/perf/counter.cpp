@@ -21,6 +21,9 @@
 
 REXCVAR_DEFINE_STRING(perf_log_csv, "", "Perf",
                       "Path to write per-frame CSV log (empty = disabled)");
+REXCVAR_DEFINE_BOOL(tracy_enable, false, "Perf",
+                    "Start the Tracy profiler client at launch (on-demand: zones are recorded only "
+                    "while a Tracy capture/profiler is connected on port 8086)");
 
 namespace rex::perf {
 

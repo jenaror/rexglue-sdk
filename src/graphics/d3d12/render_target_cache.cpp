@@ -33,10 +33,20 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
+#include <rex/stats.h>
 #include <rex/math.h>
 #include <rex/string.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+
+REXCVAR_DECLARE(bool, rov_7e3_convert_on_resolve);
+REXCVAR_DECLARE(bool, rov_bind_log);
+REXCVAR_DEFINE_BOOL(rov_shadow_debug_tint, false, "GPU/D3D12",
+                    "Diagnostics: resolve 7e3 (HDR) render targets with a shader that paints "
+                    "magenta wherever the shadow alpha tag is invalid and the 2-bit alpha "
+                    "fallback is used (sky / fog banding investigation)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DECLARE(bool, rov_7e3_track_log);
 
 REXCVAR_DEFINE_BOOL(native_stencil_value_output_d3d12_intel, false, "GPU/D3D12",
                     "Native stencil value output for Intel D3D12");
@@ -75,10 +85,16 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/resolve_full_16bpp_scaled_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_full_32bpp_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_full_32bpp_scaled_cs.h"
+// DP1 diagnostics: XE_DP1_SHADOW_DEBUG builds of the two above.
+#include "../shaders/bytecode/d3d12_5_1/resolve_full_32bpp_cs_shadowdbg.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_full_32bpp_scaled_cs_shadowdbg.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_full_64bpp_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_full_64bpp_scaled_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_full_8bpp_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_full_8bpp_scaled_cs.h"
+// DP1 fix (ROV 7e3 -> 8888), built with fxc from
+// ../shaders/edram_7e3_to_8888_cs.hlsl.
+#include "../shaders/bytecode/d3d12_5_1/edram_7e3_to_8888_cs.h"
 }  // namespace shaders
 
 const D3D12RenderTargetCache::ResolveCopyShaderCode
@@ -203,8 +219,17 @@ bool D3D12RenderTargetCache::Initialize() {
   }
 
   // Create the buffer for reinterpreting EDRAM contents.
+  // DP1 shadow alpha (LittleBitUA, 2026-09-07): the buffer is twice the EDRAM
+  // size - the second half holds, for each 32bpp sample position, a "shadow"
+  // dword written by the ROV pixel shaders for 7e3 (k_2_10_10_10_FLOAT) render
+  // targets: a 16-bit UNORM alpha in the low half and a 16-bit tag of the main
+  // dword in the high half. Readers (ROV blending, resolves, the 7e3 -> 8888
+  // reinterpretation) use the alpha only when the tag matches the main dword,
+  // so stale shadows are ignored without any tracking. This gives the game's
+  // HDR scene a full-precision alpha (the console's 7e3 alpha is 2 bits, and
+  // Deadly Premonition's sky / composite masks show contours with it).
   uint32_t edram_buffer_size =
-      xenos::kEdramSizeBytes * (draw_resolution_scale_x() * draw_resolution_scale_y());
+      xenos::kEdramSizeBytes * (draw_resolution_scale_x() * draw_resolution_scale_y()) * 2;
   D3D12_RESOURCE_DESC edram_buffer_desc;
   ui::d3d12::util::FillBufferResourceDesc(edram_buffer_desc, edram_buffer_size,
                                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
@@ -365,6 +390,19 @@ bool D3D12RenderTargetCache::Initialize() {
         rex::string::to_utf16(resolve_copy_shader_info.debug_name);
     resolve_copy_pipeline->SetName(reinterpret_cast<LPCWSTR>(resolve_copy_pipeline_name.c_str()));
     resolve_copy_pipelines_[i] = resolve_copy_pipeline;
+  }
+  // DP1 diagnostics: the shadow-debug variant of the full 32bpp resolve.
+  resolve_copy_pipeline_shadow_debug_ = ui::d3d12::util::CreateComputePipeline(
+      device,
+      draw_resolution_scaled ? shaders::resolve_full_32bpp_scaled_cs_shadowdbg
+                             : shaders::resolve_full_32bpp_cs_shadowdbg,
+      draw_resolution_scaled ? sizeof(shaders::resolve_full_32bpp_scaled_cs_shadowdbg)
+                             : sizeof(shaders::resolve_full_32bpp_cs_shadowdbg),
+      resolve_copy_root_signature_);
+  if (resolve_copy_pipeline_shadow_debug_ != nullptr) {
+    resolve_copy_pipeline_shadow_debug_->SetName(L"Resolve full 32bpp (DP1 shadow debug)");
+  } else {
+    REXGPU_WARN("D3D12RenderTargetCache: shadow-debug resolve pipeline not created");
   }
 
   // Using the cvar on emulator initialization so used pipelines are consistent
@@ -948,6 +986,19 @@ bool D3D12RenderTargetCache::Initialize() {
       return false;
     }
     resolve_rov_clear_64bpp_pipeline_->SetName(L"Resolve Clear 64bpp");
+
+    // DP1 fix: 7e3 -> 8888 in-place EDRAM conversion pipeline.
+    rov_7e3_to_8888_pipeline_ = ui::d3d12::util::CreateComputePipeline(
+        device, shaders::edram_7e3_to_8888_cs, sizeof(shaders::edram_7e3_to_8888_cs),
+        resolve_rov_clear_root_signature_);
+    if (rov_7e3_to_8888_pipeline_ == nullptr) {
+      REXGPU_ERROR(
+          "D3D12RenderTargetCache: Failed to create the EDRAM 7e3 -> 8888 "
+          "conversion pipeline");
+      Shutdown();
+      return false;
+    }
+    rov_7e3_to_8888_pipeline_->SetName(L"EDRAM 7e3 to 8888");
   } else {
     assert_unhandled_case(path_);
     Shutdown();
@@ -960,6 +1011,7 @@ bool D3D12RenderTargetCache::Initialize() {
 }
 
 void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
+  ui::d3d12::util::ReleaseAndNull(rov_7e3_to_8888_pipeline_);
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_64bpp_pipeline_);
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_32bpp_pipeline_);
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_root_signature_);
@@ -1026,6 +1078,7 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
   descriptor_pool_depth_.reset();
   descriptor_pool_color_.reset();
 
+  ui::d3d12::util::ReleaseAndNull(resolve_copy_pipeline_shadow_debug_);
   for (size_t i = 0; i < rex::countof(resolve_copy_pipelines_); ++i) {
     ui::d3d12::util::ReleaseAndNull(resolve_copy_pipelines_[i]);
   }
@@ -1220,6 +1273,74 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
         }
       }
 
+      if (REXCVAR_GET(rov_bind_log) && GetPath() == Path::kPixelShaderInterlock) {
+        const draw_util::ResolveEdramInfo& src_info = resolve_info.IsCopyingDepth()
+                                                          ? resolve_info.depth_edram_info
+                                                          : resolve_info.color_edram_info;
+        REXGPU_INFO("ROV bind: resolve copy {} base {} pitch {} fmt {} {}x{} px at x{} y{} -> dest {:08X}",
+                    resolve_info.IsCopyingDepth() ? "depth" : "color", uint32_t(src_info.base_tiles),
+                    uint32_t(src_info.pitch_tiles), uint32_t(src_info.format),
+                    uint32_t(resolve_info.coordinate_info.width_div_8) * 8, resolve_info.height_div_8 * 8,
+                    uint32_t(resolve_info.coordinate_info.edram_offset_x_div_8),
+                    uint32_t(resolve_info.coordinate_info.edram_offset_y_div_8),
+                    resolve_info.copy_dest_base);
+      }
+      // DP1 diagnostics (2026-09-13, #23): on the ROV path the copy reads the
+      // EDRAM buffer directly. If the source is an 8888 render target but some
+      // of its tiles are still tagged as holding 7e3 (HDR) bits, the copy
+      // decodes raw 7e3 as 8-bit color - the green / rainbow panels. The mirror
+      // case (7e3 source over tiles last written as 8888) is logged too.
+      if (GetPath() == Path::kPixelShaderInterlock && !resolve_info.IsCopyingDepth()) {
+        uint32_t span_base, span_row_length, span_rows, span_pitch;
+        resolve_info.GetCopyEdramTileSpan(span_base, span_row_length, span_rows, span_pitch);
+        xenos::ColorRenderTargetFormat src_format =
+            xenos::ColorRenderTargetFormat(resolve_info.color_edram_info.format);
+        bool src_is_8888 = src_format == xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
+                           src_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA;
+        bool src_is_7e3 =
+            src_format == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
+            src_format == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16;
+        if (src_is_8888 || src_is_7e3) {
+          uint32_t mismatched = 0;
+          uint32_t total = 0;
+          for (uint32_t row = 0; row < span_rows; ++row) {
+            uint32_t row_start = span_base + row * span_pitch;
+            total += span_row_length;
+            mismatched += src_is_8888 ? PixelShaderInterlockCount7e3Tiles(row_start, span_row_length)
+                                      : PixelShaderInterlockCountNon7e3Tiles(row_start, span_row_length);
+          }
+          if (mismatched) {
+            static uint32_t events_8888_from_7e3 = 0;
+            static uint32_t events_7e3_from_8888 = 0;
+            uint32_t events = src_is_8888 ? ++events_8888_from_7e3 : ++events_7e3_from_8888;
+            rex::stats::Set(src_is_8888 ? "gpu/rov/resolve_8888_from_7e3_tiles"
+                                        : "gpu/rov/resolve_7e3_from_non7e3_tiles",
+                            events);
+            bool convert = src_is_8888 && REXCVAR_GET(rov_7e3_convert_on_resolve);
+            if (events <= 20 || (events % 200) == 0 || REXCVAR_GET(rov_7e3_track_log)) {
+              REXGPU_WARN(
+                  "ROV resolve: {} of {} source tiles of a {} copy (EDRAM base {}, pitch {}, {}x{} "
+                  "px at tile offset x{} y{}) are tagged {} -> {} (event {}{})",
+                  mismatched, total, src_is_8888 ? "8888" : "7e3", span_base, span_pitch,
+                  uint32_t(resolve_info.coordinate_info.width_div_8) * 8,
+                  resolve_info.height_div_8 * 8,
+                  uint32_t(resolve_info.coordinate_info.edram_offset_x_div_8),
+                  uint32_t(resolve_info.coordinate_info.edram_offset_y_div_8),
+                  src_is_8888 ? "7e3" : "not 7e3",
+                  src_is_8888 ? "raw HDR bits decoded as 8-bit color (green / rainbow, #23)"
+                              : "8-bit bits decoded as HDR floats",
+                  events, convert ? ", converting first" : "");
+            }
+            if (convert) {
+              for (uint32_t row = 0; row < span_rows; ++row) {
+                PixelShaderInterlockTrackTiles(span_base + row * span_pitch, span_row_length, true,
+                                               src_format, true);
+              }
+            }
+          }
+        }
+      }
+
       // Make sure there is memory to write to.
       bool copy_dest_committed;
       if (draw_resolution_scaled) {
@@ -1298,7 +1419,15 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
             command_list.D3DSetComputeRoot32BitConstants(
                 0, sizeof(copy_shader_constants) / sizeof(uint32_t), &copy_shader_constants, 0);
           }
-          command_processor_.SetExternalPipeline(resolve_copy_pipelines_[size_t(copy_shader)]);
+          {
+            ID3D12PipelineState* copy_pipeline = resolve_copy_pipelines_[size_t(copy_shader)];
+            if (REXCVAR_GET(rov_shadow_debug_tint) && resolve_copy_pipeline_shadow_debug_ &&
+                copy_shader == draw_util::ResolveCopyShaderIndex::kFull32bpp &&
+                GetPath() == Path::kPixelShaderInterlock) {
+              copy_pipeline = resolve_copy_pipeline_shadow_debug_;
+            }
+            command_processor_.SetExternalPipeline(copy_pipeline);
+          }
           command_processor_.SubmitBarriers();
           command_list.D3DDispatch(copy_group_count_x, copy_group_count_y, 1);
 
@@ -1370,6 +1499,19 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           // instance), overlap of the depth and the color ranges is highly
           // unlikely.
           CommitEdramBufferUAVWrites();
+          // DP1 fix: the clear overwrites the tiles - record their new format
+          // class (no conversion needed).
+          PixelShaderInterlockTrackClear(resolve_info, clear_depth, clear_color);
+          if (REXCVAR_GET(rov_bind_log)) {
+            REXGPU_INFO("ROV bind: clear{}{} depth base {} fmt {} / color base {} fmt {} {}x{} px",
+                        clear_depth ? " depth" : "", clear_color ? " color" : "",
+                        uint32_t(resolve_info.depth_edram_info.base_tiles),
+                        uint32_t(resolve_info.depth_edram_info.format),
+                        uint32_t(resolve_info.color_edram_info.base_tiles),
+                        uint32_t(resolve_info.color_edram_info.format),
+                        uint32_t(resolve_info.coordinate_info.width_div_8) * 8,
+                        resolve_info.height_div_8 * 8);
+          }
           command_list.D3DSetComputeRootSignature(resolve_rov_clear_root_signature_);
           command_list.D3DSetComputeRootDescriptorTable(1, descriptor_edram.second);
           std::pair<uint32_t, uint32_t> clear_group_count = resolve_info.GetClearShaderGroupCount(
@@ -1714,6 +1856,74 @@ bool D3D12RenderTargetCache::IsGammaFormatHostStorageSeparate() const {
 
 void D3D12RenderTargetCache::RequestPixelShaderInterlockBarrier() {
   CommitEdramBufferUAVWrites();
+}
+
+void D3D12RenderTargetCache::PixelShaderInterlockReinterpret7e3To8888(uint32_t start_tiles,
+                                                                      uint32_t length_tiles) {
+  // DP1 fix: see RenderTargetCache::PixelShaderInterlockTrackTiles.
+  assert_true(GetPath() == Path::kPixelShaderInterlock);
+  if (!rov_7e3_to_8888_pipeline_ || !length_tiles ||
+      start_tiles + length_tiles > xenos::kEdramTileCount) {
+    return;
+  }
+  ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor_edram;
+  if (bindless_resources_used_) {
+    descriptor_edram = command_processor_.GetSystemBindlessViewHandlePair(
+        D3D12CommandProcessor::SystemBindlessView::kEdramR32G32B32A32UintUAV);
+  } else {
+    if (!command_processor_.RequestOneUseSingleViewDescriptors(1, &descriptor_edram)) {
+      return;
+    }
+    WriteEdramUintPow2UAVDescriptor(descriptor_edram.first, 4);
+  }
+  DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
+  TransitionEdramBuffer(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  // All preceding interlocked (and UAV) writes must be visible to the
+  // conversion, which reads and writes the same dwords.
+  CommitEdramBufferUAVWrites();
+  // 32bpp tiles are contiguous kEdramTileWidthSamples * kEdramTileHeightSamples
+  // * resolution scale dwords in the ROV EDRAM buffer (see
+  // edram_32bpp_tile_pitch_dwords_scaled), and the shader works on uint4s.
+  uint32_t tile_uint4s = xenos::kEdramTileWidthSamples * xenos::kEdramTileHeightSamples *
+                         (draw_resolution_scale_x() * draw_resolution_scale_y()) / 4;
+  // The third constant is the uint4 offset of the shadow alpha half of the
+  // buffer (see edram_buffer_size in Initialize).
+  uint32_t constants[3] = {start_tiles * tile_uint4s, length_tiles * tile_uint4s,
+                           xenos::kEdramTileCount * tile_uint4s};
+  command_list.D3DSetComputeRootSignature(resolve_rov_clear_root_signature_);
+  command_list.D3DSetComputeRoot32BitConstants(0, uint32_t(rex::countof(constants)), constants,
+                                               0);
+  command_list.D3DSetComputeRootDescriptorTable(1, descriptor_edram.second);
+  command_processor_.SetExternalPipeline(rov_7e3_to_8888_pipeline_);
+  command_processor_.SubmitBarriers();
+  // 64 threads x 4 uint4s per group - keep in sync with the shader.
+  constexpr uint32_t kUint4sPerGroup = 64 * 4;
+  command_list.D3DDispatch((constants[1] + kUint4sPerGroup - 1) / kUint4sPerGroup, 1, 1);
+  // The draw that follows must wait for the conversion.
+  MarkEdramBufferModified(EdramBufferModificationStatus::kAsUAV);
+}
+
+void D3D12RenderTargetCache::PixelShaderInterlockTrackClear(
+    const draw_util::ResolveInfo& resolve_info, bool clear_depth, bool clear_color) {
+  // DP1 fix: mark the cleared tiles (row by row - the resolve area is a
+  // rectangle within the pitch) with the format class of the clear.
+  for (uint32_t i = 0; i < 2; ++i) {
+    bool is_color = i != 0;
+    if (is_color ? !clear_color : !clear_depth) {
+      continue;
+    }
+    const draw_util::ResolveEdramInfo& edram_info =
+        is_color ? resolve_info.color_edram_info : resolve_info.depth_edram_info;
+    uint32_t base_tiles, row_length_used_tiles, rows;
+    draw_util::GetResolveEdramTileSpan(edram_info, resolve_info.coordinate_info,
+                                       resolve_info.height_div_8, base_tiles,
+                                       row_length_used_tiles, rows);
+    for (uint32_t row = 0; row < rows; ++row) {
+      PixelShaderInterlockTrackTiles(base_tiles + row * edram_info.pitch_tiles,
+                                     row_length_used_tiles, is_color,
+                                     xenos::ColorRenderTargetFormat(edram_info.format), false);
+    }
+  }
 }
 
 void D3D12RenderTargetCache::TransitionEdramBuffer(D3D12_RESOURCE_STATES new_state) {
@@ -3126,6 +3336,20 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
                       dest_color_format ==
                           xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16)) {
             a.OpMov(dxbc::Dest::O(0), dxbc::Src::R(1));
+          } else if (dest_is_color &&
+                     (dest_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
+                      dest_color_format ==
+                          xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA)) {
+            // DP1 fix (LittleBitUA, 2026-06-20, re-applied on nightly 0c7b01a
+            // 2026-09-05): HDR 7e3 -> 8888 ownership transfer with
+            // value-clipping instead of bit-preservation. Bit-preserving is
+            // Xenos-faithful, but the raw 7e3 bits unpacked as UNORM8 leak
+            // through later tonemap + alpha-blend passes wherever src.a == 0
+            // (alpha-tested hair, foliage, statue billboards in Deadly
+            // Premonition) as rainbow speckles. Saturating the HDR floats to
+            // [0, 1] and writing them as UNORM8 leaves clipped-HDR residue at
+            // those pixels, visually indistinguishable from the tonemap output.
+            a.OpMov(dxbc::Dest::O(0), dxbc::Src::R(1), true);
           } else {
             color_packed_in_r1x = true;
             // Float16 has a wider range for both color and alpha, also NaNs -

@@ -381,6 +381,20 @@ class PipelineCache {
   FILE* pipeline_storage_file_ = nullptr;
   bool pipeline_storage_file_flush_needed_ = false;
 
+  // DP1 v1.1 (Downpour port): ID3D12PipelineLibrary blob cache of driver-
+  // compiled PSOs, in cache/shaders/local/ (GPU/driver specific, never
+  // shipped). LoadGraphicsPipeline hit = microseconds instead of a 100-800 ms
+  // driver compile. Library calls are serialized by pipeline_library_mutex_;
+  // the CreateGraphicsPipelineState fallback stays outside the lock.
+  Microsoft::WRL::ComPtr<ID3D12PipelineLibrary> pipeline_library_;
+  std::vector<uint8_t> pipeline_library_blob_;
+  std::filesystem::path pipeline_library_path_;
+  std::mutex pipeline_library_mutex_;
+  std::atomic<uint32_t> pipeline_library_load_hits_{0};
+  std::atomic<uint32_t> pipeline_library_store_count_{0};
+  std::atomic<bool> pipeline_library_dirty_{false};
+  void FlushPipelineLibraryToDisk();
+
   // Thread for asynchronous writing to the storage streams.
   void StorageWriteThread();
   std::mutex storage_write_request_lock_;

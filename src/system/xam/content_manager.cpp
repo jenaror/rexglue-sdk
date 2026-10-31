@@ -20,8 +20,11 @@
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/stfs_container_device.h>
 #include <rex/string.h>
+#include <rex/cvar.h>
+#include <rex/logging.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/content_device.h>
+#include <rex/system/xam/content_dir_ops.h>
 #include <rex/system/xam/content_manager.h>
 #include <rex/system/xfile.h>
 #include <rex/system/xobject.h>
@@ -29,6 +32,16 @@
 namespace rex {
 namespace system {
 namespace xam {
+
+// DPRecomp #21 (2026-09-19): overwriting a save container removes its host
+// directory first; when another process holds a file inside it (real-time
+// antivirus on the freshly written save, an indexer) the removal fails for a
+// while. Retry within this budget before reporting the failure to the game.
+REXCVAR_DEFINE_INT32(content_delete_retry_ms, 3000, "Kernel",
+                     "How long XamContent delete/overwrite keeps retrying the removal of a "
+                     "content directory that another process holds open (ms; 0 = one attempt)")
+    .range(0, 30000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 static const char* kThumbnailFileName = "__thumbnail.png";
 
@@ -188,6 +201,17 @@ bool ContentManager::ContentExists(uint64_t xuid, const XCONTENT_AGGREGATE_DATA&
   return std::filesystem::exists(path);
 }
 
+bool ContentManager::ContentDirectoryUsable(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    if (IsContentOpen(data)) {
+      return false;
+    }
+  }
+  std::error_code ec;
+  return std::filesystem::is_directory(ResolvePackagePath(xuid, data), ec);
+}
+
 X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGATE_DATA data,
                                                 uint32_t license_mask) {
   if (data.title_id == uint32_t(-1)) {
@@ -256,7 +280,7 @@ X_RESULT ContentManager::ReadContentHeaderFile(const std::string_view file_name,
 }
 
 X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_t xuid,
-                                       const XCONTENT_AGGREGATE_DATA& data) {
+                                       const XCONTENT_AGGREGATE_DATA& data, bool reuse_directory) {
   {
     auto global_lock = global_critical_region_.Acquire();
     if (open_packages_.count(string::string_key_case(root_name))) {
@@ -265,10 +289,14 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
   }
 
   auto package_path = ResolvePackagePath(xuid, data);
-  if (std::filesystem::exists(package_path)) {
+  std::error_code ec;
+  const bool exists = std::filesystem::is_directory(package_path, ec);
+  if (exists && !reuse_directory) {
     return X_ERROR_ALREADY_EXISTS;
   }
-  if (!std::filesystem::create_directories(package_path)) {
+  if (!exists && !std::filesystem::create_directories(package_path, ec)) {
+    REXSYS_WARN("XamContent create: cannot create '{}': {} ({})", package_path.string(),
+                ec.message(), ec.value());
     return X_ERROR_ACCESS_DENIED;
   }
   auto package = ResolvePackage(root_name, xuid, data);
@@ -369,16 +397,31 @@ X_RESULT ContentManager::DeleteContent(uint64_t xuid, const XCONTENT_AGGREGATE_D
 
   if (IsContentOpen(data)) {
     // TODO(Gliniak): Get real error code for this case.
+    REXSYS_WARN("XamContent delete: '{}' is still open under another root",
+                std::string(data.file_name()));
     return X_ERROR_ACCESS_DENIED;
   }
 
   auto package_path = ResolvePackagePath(xuid, data);
-  std::error_code ec;
-  auto dir_removed = std::filesystem::remove_all(package_path, ec);
-  if (ec ||
-      std::filesystem::status(package_path, ec).type() != std::filesystem::file_type::not_found) {
+  const bool had_directory = std::filesystem::is_directory(package_path);
+  const auto removal = RemoveDirWithRetry(
+      package_path, std::chrono::milliseconds(REXCVAR_GET(content_delete_retry_ms)),
+      std::chrono::milliseconds(50));
+  if (!removal.removed) {
+    // Which step failed and why, for the log (DPRecomp #21).
+    REXSYS_WARN("XamContent delete: '{}' still exists after {} attempt(s) over {} ms: {} ({}){}",
+                package_path.string(), removal.attempts, removal.waited.count(),
+                removal.last_error.message(), removal.last_error.value(),
+                removal.still_directory ? " - a file inside is held open by another process"
+                                        : "");
     return X_ERROR_ACCESS_DENIED;
   }
+  if (removal.attempts > 1) {
+    REXSYS_INFO("XamContent delete: '{}' removed after {} attempts ({} ms; last error {} ({}))",
+                package_path.string(), removal.attempts, removal.waited.count(),
+                removal.last_error.message(), removal.last_error.value());
+  }
+  const bool dir_removed = had_directory;
 
   uint64_t used_xuid = (data.xuid != uint64_t(-1) && data.xuid != 0) ? uint64_t(data.xuid) : xuid;
   auto header_path =
@@ -386,7 +429,7 @@ X_RESULT ContentManager::DeleteContent(uint64_t xuid, const XCONTENT_AGGREGATE_D
   std::error_code ec2;
   bool header_removed = std::filesystem::remove(header_path, ec2);
 
-  if (dir_removed > 0 || header_removed) {
+  if (dir_removed || header_removed) {
     return X_ERROR_SUCCESS;
   }
   return X_ERROR_FILE_NOT_FOUND;
@@ -426,17 +469,22 @@ X_RESULT ContentManager::UnmountAndDeleteContent(uint64_t xuid,
   auto header_path =
       ResolvePackageHeaderPath(data.file_name(), used_xuid, data.title_id, data.content_type);
 
-  std::error_code ec;
-  auto dir_removed = std::filesystem::remove_all(package_path, ec);
-  if (ec ||
-      std::filesystem::status(package_path, ec).type() != std::filesystem::file_type::not_found) {
+  const bool had_directory = std::filesystem::is_directory(package_path);
+  const auto removal = RemoveDirWithRetry(
+      package_path, std::chrono::milliseconds(REXCVAR_GET(content_delete_retry_ms)),
+      std::chrono::milliseconds(50));
+  if (!removal.removed) {
+    REXSYS_WARN("XamContent unmount+delete: '{}' still exists after {} attempt(s) over {} ms: {} ({})",
+                package_path.string(), removal.attempts, removal.waited.count(),
+                removal.last_error.message(), removal.last_error.value());
     return X_ERROR_ACCESS_DENIED;
   }
+  const bool dir_removed = had_directory;
 
   std::error_code ec2;
   bool header_removed = std::filesystem::remove(header_path, ec2);
 
-  if (dir_removed > 0 || header_removed) {
+  if (dir_removed || header_removed) {
     return X_ERROR_SUCCESS;
   }
   return X_ERROR_FILE_NOT_FOUND;

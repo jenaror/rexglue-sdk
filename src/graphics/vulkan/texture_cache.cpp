@@ -22,6 +22,7 @@
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/host_texture_extent.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/vulkan/command_processor.h>
@@ -1974,8 +1975,17 @@ VkImageView VulkanTextureCache::VulkanTexture::GetOrCreate3DAs2DImageView(bool i
     image_create_info.flags = 0;
     image_create_info.imageType = VK_IMAGE_TYPE_2D;
     image_create_info.format = wrapper_format;
-    image_create_info.extent.width = key().GetWidth();
-    image_create_info.extent.height = key().GetHeight();
+    // DP1 2026-09-14 (DPRecomp #22): the loader uploads the scaled layout for
+    // scaled_resolve keys - the image must be scaled like CreateTexture's.
+    {
+      const rex::gpu::texture_copy::Extent2 host_extent =
+          rex::gpu::texture_copy::HostResourceExtent(
+              key().GetWidth(), key().GetHeight(), key().scaled_resolve != 0,
+              vulkan_texture_cache.draw_resolution_scale_x(),
+              vulkan_texture_cache.draw_resolution_scale_y());
+      image_create_info.extent.width = host_extent.width;
+      image_create_info.extent.height = host_extent.height;
+    }
     image_create_info.extent.depth = 1;
     image_create_info.mipLevels = 1;
     image_create_info.arrayLayers = 1;

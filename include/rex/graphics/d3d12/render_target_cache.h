@@ -186,6 +186,8 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   };
   static const ResolveCopyShaderCode
       kResolveCopyShaders[size_t(draw_util::ResolveCopyShaderIndex::kCount)];
+  // DP1 diagnostics: XE_DP1_SHADOW_DEBUG variant of the full 32bpp resolve.
+  ID3D12PipelineState* resolve_copy_pipeline_shadow_debug_ = nullptr;
   ID3D12PipelineState* resolve_copy_pipelines_[size_t(draw_util::ResolveCopyShaderIndex::kCount)] =
       {};
 
@@ -750,6 +752,15 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   ID3D12PipelineState* resolve_rov_clear_32bpp_pipeline_ = nullptr;
   // Clearing 64bpp color.
   ID3D12PipelineState* resolve_rov_clear_64bpp_pipeline_ = nullptr;
+
+  // DP1 fix: value-clipping 7e3 -> 8888 in-place EDRAM conversion (uses the
+  // resolve EDRAM buffer clear root signature: root constants + uint4 UAV).
+  ID3D12PipelineState* rov_7e3_to_8888_pipeline_ = nullptr;
+  void PixelShaderInterlockReinterpret7e3To8888(uint32_t start_tiles,
+                                                uint32_t length_tiles) override;
+  // Records what a resolve clear writes for the 7e3 tracking.
+  void PixelShaderInterlockTrackClear(const draw_util::ResolveInfo& resolve_info, bool clear_depth,
+                                      bool clear_color);
 };
 
 }  // namespace rex::graphics::d3d12

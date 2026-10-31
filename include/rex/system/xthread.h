@@ -333,9 +333,15 @@ class XThread : public XObject {
   bool is_running() const { return running_; }
 
   uint32_t thread_id() const { return thread_id_; }
+  // DP1 diagnostics: the name given by the guest (SetThreadName) or the creator.
+  const std::string& name() const { return thread_name_; }
   uint32_t last_error();
   void set_last_error(uint32_t error_code);
   void set_name(const std::string_view name);
+  // DP1 diagnostics: a game hook can announce the name of the thread the guest is
+  // about to create on this thread; ExCreateThread applies it to the new XThread.
+  static void SetPendingGuestThreadName(std::string_view name);
+  static std::string TakePendingGuestThreadName();
 
   X_STATUS Create();
   X_STATUS Exit(int exit_code);

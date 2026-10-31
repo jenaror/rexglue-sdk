@@ -19,6 +19,7 @@
 #include <vector>
 
 #include <rex/assert.h>
+#include <rex/graphics/pipeline/texture/replacement.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/shared_memory.h>
@@ -214,6 +215,11 @@ class TextureCache {
 
     uint64_t GetHostMemoryUsage() const { return host_memory_usage_; }
 
+    // Hash of the guest base level at creation time (0 when the texture
+    // dump/replacement registry is inactive). See texture/replacement.h.
+    uint64_t data_hash() const { return data_hash_; }
+    void SetDataHash(uint64_t hash) { data_hash_ = hash; }
+
     uint64_t last_usage_submission_index() const { return last_usage_submission_index_; }
     uint64_t last_usage_time() const { return last_usage_time_; }
     static constexpr uint32_t kOutdatedBitBase = UINT32_C(1) << 0;
@@ -255,6 +261,7 @@ class TextureCache {
     texture_util::TextureGuestLayout guest_layout_;
 
     uint64_t host_memory_usage_ = 0;
+    uint64_t data_hash_ = 0;
 
     uint64_t last_usage_submission_index_;
     uint64_t last_usage_time_;
@@ -582,6 +589,16 @@ class TextureCache {
 
   const RegisterFile& register_file_;
   SharedMemory& shared_memory_;
+
+ protected:
+  // Set by FindOrCreateTexture right before CreateTexture so the backend
+  // can pick a replacement image for the texture being created.
+  uint64_t creating_data_hash_ = 0;
+  texture_replacement::GuestBaseView creating_view_;
+  // Computes the base-level hash (and dumps the texture if enabled).
+  uint64_t HashGuestTexture(const TextureKey& key, texture_replacement::GuestBaseView& view_out) const;
+
+ private:
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
 

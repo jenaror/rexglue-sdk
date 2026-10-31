@@ -26,6 +26,7 @@
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/immediate_drawer.h>
 #include <rex/ui/overlay/debug_overlay.h>
+#include <rex/ui/overlay/pso_compile_indicator_overlay.h>
 #include <rex/ui/window.h>
 #include <rex/ui/window_listener.h>
 #include <rex/ui/windowed_app.h>
@@ -297,6 +298,9 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::unique_ptr<Runtime> runtime_;
   std::unique_ptr<ui::Window> window_;
   std::thread module_thread_;
+  // DP1 v1.1: second half of LaunchModule, run once the shader storage replay
+  // (shown by ShaderCompileDialog) has finished.
+  void FinishModuleLaunch(system::object_ref<system::XThread> main_thread);
   std::atomic<bool> shutting_down_{false};
   std::unique_ptr<ui::ImmediateDrawer> immediate_drawer_;
   std::unique_ptr<ui::ImGuiDrawer> imgui_drawer_;
@@ -304,6 +308,8 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   // Built-in overlays
   std::shared_ptr<LogCaptureSink> log_sink_;
   std::unique_ptr<ui::DebugOverlayDialog> debug_overlay_;
+  // DP1 v1.1: corner badge while pipelines compile (Downpour port).
+  std::unique_ptr<ui::PsoCompileIndicatorDialog> pso_compile_indicator_overlay_;
   std::unique_ptr<ui::ConsoleDialog> console_overlay_;
   std::unique_ptr<ui::SettingsDialog> settings_overlay_;
   std::unique_ptr<ui::ImGuiDialog> achievements_overlay_;

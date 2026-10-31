@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstring>
 #include <rex/cvar.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
@@ -146,6 +147,28 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
               license_mask_ptr](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
     X_RESULT result = X_ERROR_INVALID_PARAMETER;
     kDispositionState disposition = kDispositionState::Unknown;
+    // DPRecomp #21: when the old package directory cannot be removed (a file
+    // inside is held open by another process for longer than the retry
+    // budget), overwrite in place instead of failing: the game recreates its
+    // files with CREATE_ALWAYS anyway, and the old save stays readable until
+    // it does. Failing here would make Deadly Premonition wait forever.
+    bool reuse_directory = false;
+    auto overwrite_existing = [&](const char* how) {
+      if (!content_manager->ContentExists(xuid, content_data)) {
+        return true;
+      }
+      if (content_manager->DeleteContent(xuid, content_data) == X_ERROR_SUCCESS) {
+        return true;
+      }
+      if (content_manager->ContentDirectoryUsable(xuid, content_data)) {
+        REXKRNL_WARN("XamContent {}: old container directory could not be removed; "
+                     "reusing it in place (see the delete warning above)",
+                     how);
+        reuse_directory = true;
+        return true;
+      }
+      return false;
+    };
     switch (flags & 0xF) {
       case 1:  // CREATE_NEW
                // Fail if exists.
@@ -160,8 +183,7 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
         // Close any existing mount under this root name first.
         // Games may reuse the same root without explicitly closing.
         content_manager->CloseContent(root_name);
-        if (content_manager->ContentExists(xuid, content_data) &&
-            content_manager->DeleteContent(xuid, content_data) != X_ERROR_SUCCESS) {
+        if (!overwrite_existing("create-always")) {
           result = X_ERROR_ACCESS_DENIED;
           break;
         }
@@ -189,7 +211,7 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
           result = X_ERROR_PATH_NOT_FOUND;
         } else {
           content_manager->CloseContent(root_name);
-          if (content_manager->DeleteContent(xuid, content_data) != X_ERROR_SUCCESS) {
+          if (!overwrite_existing("truncate-existing")) {
             result = X_ERROR_ACCESS_DENIED;
           } else {
             disposition = kDispositionState::Create;
@@ -203,12 +225,28 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
 
     uint32_t content_license = 0;
     if (disposition == kDispositionState::Create) {
-      result = content_manager->CreateContent(root_name, xuid, content_data);
+      result = content_manager->CreateContent(root_name, xuid, content_data, reuse_directory);
       if (result == X_ERROR_SUCCESS) {
         content_manager->WriteContentHeaderFile(xuid, content_data);
       }
     } else if (disposition == kDispositionState::Open) {
       result = content_manager->OpenContent(root_name, xuid, content_data, content_license);
+    }
+
+    // DP1 diagnostics (#21): every save-container step with its result.
+    {
+      std::string file_name(content_data.file_name_raw,
+                            strnlen(content_data.file_name_raw, sizeof(content_data.file_name_raw)));
+      if (result == X_ERROR_SUCCESS) {
+        REXKRNL_INFO("XamContent {}: root '{}' file '{}' type {:#x} -> ok",
+                     disposition == kDispositionState::Create ? "create" : "open",
+                     root_name, file_name, static_cast<uint32_t>(content_data.content_type.get()));
+      } else {
+        REXKRNL_WARN("XamContent {}: root '{}' file '{}' type {:#x} flags {:#x} -> error {:#x}",
+                     disposition == kDispositionState::Create ? "create" : "open",
+                     root_name, file_name, static_cast<uint32_t>(content_data.content_type.get()),
+                     flags, result);
+      }
     }
 
     if (license_mask_ptr && result == X_ERROR_SUCCESS) {
@@ -276,6 +314,11 @@ u32 XamContentFlush_entry(mapped_string root_name, mapped_void overlapped_ptr) {
 u32 XamContentClose_entry(mapped_string root_name, mapped_void overlapped_ptr) {
   // Closes a previously opened root from XamContentCreate*.
   auto result = REX_KERNEL_STATE()->content_manager()->CloseContent(root_name.value());
+  if (result == X_ERROR_SUCCESS) {
+    REXKRNL_INFO("XamContent close: root '{}' -> ok", root_name.value());
+  } else {
+    REXKRNL_WARN("XamContent close: root '{}' -> error {:#x}", root_name.value(), result);
+  }
 
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
@@ -382,6 +425,17 @@ u32 XamContentDelete_entry(u32 user_index, mapped_void content_data_ptr,
   XCONTENT_AGGREGATE_DATA content_data = *content_data_ptr.as<XCONTENT_DATA*>();
 
   auto result = REX_KERNEL_STATE()->content_manager()->DeleteContent(xuid, content_data);
+  {
+    std::string file_name(content_data.file_name_raw,
+                          strnlen(content_data.file_name_raw, sizeof(content_data.file_name_raw)));
+    if (result == X_ERROR_SUCCESS) {
+      REXKRNL_INFO("XamContent delete: file '{}' type {:#x} -> ok", file_name,
+                   static_cast<uint32_t>(content_data.content_type.get()));
+    } else {
+      REXKRNL_WARN("XamContent delete: file '{}' type {:#x} -> error {:#x}", file_name,
+                   static_cast<uint32_t>(content_data.content_type.get()), result);
+    }
+  }
 
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);

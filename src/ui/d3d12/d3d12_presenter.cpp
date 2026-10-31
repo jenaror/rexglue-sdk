@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cmath>
 #include <memory>
@@ -88,7 +89,12 @@ bool D3D12Presenter::EnsureTemporalUpscalerContext(uint32_t render_width, uint32
     ffxCreateContextDescUpscale create_desc = {};
     create_desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
     create_desc.header.pNext = nullptr;
-    create_desc.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
+    // DP1 (LittleBitUA, 2026-09-07): the presenter feeds an SDR, display-referred
+    // image, so neither HDR mode nor auto exposure apply. With them on (and
+    // reset every frame, see the dispatch) the upscaler re-measured the
+    // exposure of every frame from its own content: whole-frame brightness and
+    // tint jumped between consecutive frames and on scene changes.
+    create_desc.flags = 0;
     create_desc.maxRenderSize.width = render_width;
     create_desc.maxRenderSize.height = render_height;
     create_desc.maxUpscaleSize.width = output_width;
@@ -166,8 +172,10 @@ bool D3D12Presenter::DispatchTemporalUpscaler(ID3D12GraphicsCommandList* command
       output_resource, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS, FFX_API_RESOURCE_USAGE_UAV);
   dispatch_desc.jitterOffset.x = 0.0f;
   dispatch_desc.jitterOffset.y = 0.0f;
-  dispatch_desc.motionVectorScale.x = float(input_width);
-  dispatch_desc.motionVectorScale.y = float(input_height);
+  // DP1: the color image stands in for the motion vectors; a zero scale makes
+  // them all zero (no motion) instead of garbage scaled to the input size.
+  dispatch_desc.motionVectorScale.x = 0.0f;
+  dispatch_desc.motionVectorScale.y = 0.0f;
   dispatch_desc.renderSize.width = input_width;
   dispatch_desc.renderSize.height = input_height;
   dispatch_desc.upscaleSize.width = output_width;
@@ -187,6 +195,13 @@ bool D3D12Presenter::DispatchTemporalUpscaler(ID3D12GraphicsCommandList* command
 
   ffxContext* context = reinterpret_cast<ffxContext*>(&temporal_upscaler_context_);
   if (ffxDispatch(context, &dispatch_desc.header) != FFX_API_RETURN_OK) {
+    static std::atomic<bool> dispatch_failure_logged = false;
+    if (!dispatch_failure_logged.exchange(true)) {
+      REXLOG_WARN(
+          "D3D12Presenter: FidelityFX temporal upscaler dispatch failed ({}x{} -> {}x{}), "
+          "falling back to spatial FSR",
+          input_width, input_height, output_width, output_height);
+    }
     return false;
   }
 
@@ -867,6 +882,14 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
               command_list, effect_source_resource, effect_input_width, effect_input_height,
               effect_dest_resource, guest_output_flow.effect_output_sizes[i].first,
               guest_output_flow.effect_output_sizes[i].second, guest_output_paint_config);
+          // The FidelityFX dispatch binds its own descriptor heaps on the
+          // command list. The following effects (RCAS, bilinear) set root
+          // descriptor tables from the presenter's view heap, which is only
+          // valid while that heap is the one currently bound - otherwise it's
+          // D3D12 EXECUTION ERROR #708 SET_DESCRIPTOR_TABLE_INVALID. Hardware
+          // usually tolerates it, but with Steam's Game Recording hooked into
+          // the swap chain it produced a black screen (DPRecomp issue #13).
+          command_list->SetDescriptorHeaps(1, &view_heap);
           if (!temporal_dispatch_done) {
             D3D12_RESOURCE_BARRIER barrier_uav_to_rtv;
             barrier_uav_to_rtv.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;

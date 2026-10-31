@@ -12,6 +12,7 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <rex/cvar.h>
 #include <rex/filesystem/device.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
@@ -28,6 +29,11 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 #include <rex/thread/mutex.h>
+
+REXCVAR_DEFINE_BOOL(vfs_log_opens, false, "VFS",
+                    "Log every successful NtCreateFile/NtOpenFile with its path and handle "
+                    "(DP1 diagnostics for missing-asset and streaming bugs)");
+
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -172,6 +178,9 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
     REXKRNL_IMPORT_FAIL("NtCreateFile", "path='{}' -> {:#x}", target_path, result);
   } else {
     REXKRNL_IMPORT_RESULT("NtCreateFile", "{:#x} handle={:#x}", result, handle);
+    if (REXCVAR_GET(vfs_log_opens)) {
+      REXKRNL_INFO("[NtCreateFile] '{}' -> handle {:#x}", target_path, handle);
+    }
   }
   return result;
 }

@@ -26,7 +26,31 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
+#include <rex/stats.h>
 #include <rex/math.h>
+
+// DP1 diagnostics (2026-09-13, DPRecomp #23 green / rainbow UI panels on the
+// ROV path). The interlock path keeps a per-tile "holds 7e3 color" flag and
+// converts 7e3 -> 8888 in place when an 8888 draw binds those tiles, but only
+// over the draw's ESTIMATED extent. These switches make every step visible in
+// the log and in the [stats] line, and give two A/B experiments.
+REXCVAR_DEFINE_BOOL(rov_7e3_track_log, false, "GPU",
+                    "Log every ROV 7e3 -> 8888 tile conversion and every 8888 draw whose "
+                    "estimated extent leaves 7e3-tagged tiles behind (DPRecomp #23)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(rov_bind_log, false, "GPU",
+                    "Diagnostics: log every change of the bound render target set (EDRAM "
+                    "base, format, estimated length), every clear and every resolve copy on "
+                    "the ROV path, with the frame number")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(rov_8888_full_extent, false, "GPU",
+                    "Experiment: for 8888 color draws on the ROV path, track and convert the "
+                    "render target's full EDRAM range instead of the estimated draw extent")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(rov_7e3_convert_on_resolve, false, "GPU",
+                    "Experiment: when a resolve copies an 8888 render target from tiles still "
+                    "tagged 7e3, convert them first instead of copying raw HDR bits")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(mrt_edram_used_range_clamp_to_min, true, "GPU",
                     "Clamp MRT EDRAM used range to minimum");
@@ -85,6 +109,10 @@ void RenderTargetCache::GetPSIColorFormatInfo(xenos::ColorRenderTargetFormat for
       }
       if (!(write_mask & 0b1000)) {
         keep_mask_low |= uint32_t(3) << 30;
+        // DP1 shadow alpha: also keep the 16-bit alpha in the low half of the
+        // shadow dword, which the D3D12 ROV output-merger code holds in the
+        // "upper 32 bits" register for 7e3 render targets.
+        keep_mask_high |= 0xFFFFu;
       }
     } break;
     case xenos::ColorRenderTargetFormat::k_16_16:
@@ -341,6 +369,7 @@ void RenderTargetCache::InitializeCommon() {
 }
 
 void RenderTargetCache::DestroyAllRenderTargets(bool shutting_down) {
+  std::memset(interlock_tile_is_7e3_, 0, sizeof(interlock_tile_is_7e3_));
   ownership_ranges_.clear();
   if (!shutting_down) {
     ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
@@ -457,6 +486,9 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   // depth_and_color_rts_used_bits -> EDRAM base.
   uint32_t edram_bases[1 + xenos::kMaxColorRenderTargets];
   uint32_t resource_formats[1 + xenos::kMaxColorRenderTargets];
+  // DP1 fix (pixel shader interlock): the real guest color formats, as
+  // resource_formats only carries the pixel size on the interlock path.
+  xenos::ColorRenderTargetFormat guest_color_formats[1 + xenos::kMaxColorRenderTargets] = {};
   uint32_t rts_are_64bpp = 0;
   if (is_rasterization_done) {
     if (normalized_depth_control.z_enable || normalized_depth_control.stencil_enable) {
@@ -477,6 +509,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
       edram_bases[rt_bit_index] = color_info.color_base;
       xenos::ColorRenderTargetFormat color_format =
           regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]).color_format;
+      guest_color_formats[rt_bit_index] = color_format;
       bool is_64bpp = xenos::IsColorRenderTargetFormat64bpp(color_format);
       if (is_64bpp) {
         rts_are_64bpp |= uint32_t(1) << rt_bit_index;
@@ -625,6 +658,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   RenderTargetKey rt_keys[1 + xenos::kMaxColorRenderTargets];
   RenderTarget* rts[1 + xenos::kMaxColorRenderTargets];
   uint32_t rt_lengths_tiles[1 + xenos::kMaxColorRenderTargets];
+  uint32_t rt_full_lengths_tiles[1 + xenos::kMaxColorRenderTargets];
   uint32_t length_used_tiles_at_32bpp =
       ((height_used << uint32_t(msaa_samples >= xenos::MsaaSamples::k2X)) +
        (xenos::kEdramTileHeightSamples - 1)) /
@@ -650,12 +684,25 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     // The last render target can occupy the EDRAM until the base of the first
     // render target (itself in case of 1 render target) with EDRAM addressing
     // wrapping.
+    uint32_t rt_next_base_distance =
+        ((i + 1 < edram_bases_sorted_count) ? edram_bases_sorted[i + 1].first
+                                            : (xenos::kEdramTileCount + edram_bases_sorted[0].first)) -
+        rt_base;
     rt_lengths_tiles[i] = std::min(std::min(length_used_tiles_at_32bpp << rt_is_64bpp,
                                             rt_max_distance_tiles_at_64bpp >> (rt_is_64bpp ^ 1)),
-                                   ((i + 1 < edram_bases_sorted_count)
-                                        ? edram_bases_sorted[i + 1].first
-                                        : (xenos::kEdramTileCount + edram_bases_sorted[0].first)) -
-                                       rt_base);
+                                   rt_next_base_distance);
+    // DP1 diagnostics (#23): the range the render target would cover at its
+    // full height, with the same neighbour clamps - what a draw can touch at
+    // most when the extent estimate is short.
+    uint32_t length_full_tiles_at_32bpp =
+        ((GetRenderTargetHeight(pitch_tiles_at_32bpp, msaa_samples)
+          << uint32_t(msaa_samples >= xenos::MsaaSamples::k2X)) +
+         (xenos::kEdramTileHeightSamples - 1)) /
+        xenos::kEdramTileHeightSamples * pitch_tiles_at_32bpp;
+    rt_full_lengths_tiles[i] =
+        std::min(std::min(length_full_tiles_at_32bpp << rt_is_64bpp,
+                          rt_max_distance_tiles_at_64bpp >> (rt_is_64bpp ^ 1)),
+                 rt_next_base_distance);
   }
 
   if (interlock_barrier_only) {
@@ -675,6 +722,73 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     }
     if (interlock_barrier_needed) {
       RequestPixelShaderInterlockBarrier();
+    }
+    if (REXCVAR_GET(rov_bind_log)) {
+      // DP1 diagnostics: one line per change of the bound set.
+      std::string binds;
+      for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+        const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
+        uint32_t rt_bit_index = rt_base_index.second;
+        if (!binds.empty()) {
+          binds += " | ";
+        }
+        if (rt_bit_index == 0) {
+          fmt::format_to(std::back_inserter(binds), "depth base {} fmt {} len {}",
+                         rt_base_index.first, uint32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_format),
+                         rt_lengths_tiles[i]);
+        } else {
+          fmt::format_to(std::back_inserter(binds), "color{} base {} fmt {} len {}",
+                         rt_bit_index - 1, rt_base_index.first,
+                         uint32_t(guest_color_formats[rt_bit_index]), rt_lengths_tiles[i]);
+        }
+      }
+      fmt::format_to(std::back_inserter(binds), " (pitch {} msaa {}x)", pitch_tiles_at_32bpp,
+                     uint32_t(1) << uint32_t(msaa_samples));
+      if (binds != rov_bind_log_last_) {
+        rov_bind_log_last_ = binds;
+        REXGPU_INFO("ROV bind: {}", binds);
+      }
+    }
+    // DP1 fix: convert tiles still holding 7e3 color that are now bound as
+    // 8888 color, and record what this draw is going to write. Done after the
+    // barrier request (the conversion itself commits all preceding interlocked
+    // writes anyway) and before ChangeOwnership, since a full barrier placed by
+    // the implementation resets the ownership map.
+    for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+      const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
+      uint32_t rt_bit_index = rt_base_index.second;
+      xenos::ColorRenderTargetFormat rt_color_format = guest_color_formats[rt_bit_index];
+      bool rt_is_8888_color =
+          rt_bit_index != 0 && (rt_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
+                                rt_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA);
+      uint32_t track_length = rt_lengths_tiles[i];
+      if (rt_is_8888_color) {
+        // DP1 diagnostics (#23): tiles the draw may still reach beyond the
+        // estimated extent that hold 7e3 bits. If such a draw does reach them,
+        // its 8-bit output lands on raw HDR bits: green / rainbow panels.
+        uint32_t beyond_start = rt_base_index.first + rt_lengths_tiles[i];
+        uint32_t beyond_length = rt_full_lengths_tiles[i] > rt_lengths_tiles[i]
+                                     ? rt_full_lengths_tiles[i] - rt_lengths_tiles[i]
+                                     : 0;
+        uint32_t stale_7e3 = PixelShaderInterlockCount7e3Tiles(beyond_start, beyond_length);
+        if (stale_7e3) {
+          static uint32_t stale_events = 0;
+          ++stale_events;
+          rex::stats::Set("gpu/rov/8888_draws_with_7e3_beyond_extent", stale_events);
+          if (REXCVAR_GET(rov_7e3_track_log)) {
+            REXGPU_INFO(
+                "ROV 7e3 track: 8888 draw at EDRAM base {} pitch {} (est. {} of {} tiles) leaves {} "
+                "7e3-tagged tiles beyond its estimated extent [{}, +{})",
+                rt_base_index.first, pitch_tiles_at_32bpp, rt_lengths_tiles[i],
+                rt_full_lengths_tiles[i], stale_7e3, beyond_start, beyond_length);
+          }
+        }
+        if (REXCVAR_GET(rov_8888_full_extent)) {
+          track_length = rt_full_lengths_tiles[i];
+        }
+      }
+      PixelShaderInterlockTrackTiles(rt_base_index.first, track_length, rt_bit_index != 0,
+                                     rt_color_format, true);
     }
   }
 
@@ -1142,6 +1256,77 @@ void RenderTargetCache::PixelShaderInterlockFullEdramBarrierPlaced() {
   }
   ownership_ranges_.clear();
   ownership_ranges_.emplace(0, empty_range);
+}
+
+void RenderTargetCache::PixelShaderInterlockTrackTiles(uint32_t start_tiles, uint32_t length_tiles,
+                                                       bool is_color,
+                                                       xenos::ColorRenderTargetFormat color_format,
+                                                       bool convert_if_7e3_to_8888) {
+  assert_true(GetPath() == Path::kPixelShaderInterlock);
+  if (!length_tiles) {
+    return;
+  }
+  length_tiles = std::min(length_tiles, xenos::kEdramTileCount);
+  start_tiles &= xenos::kEdramTileCount - 1;
+  bool is_7e3 =
+      is_color && (color_format == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
+                   color_format == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16);
+  bool is_8888 = is_color && (color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
+                              color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA);
+  // The range may wrap around the end of the EDRAM - handle it as up to two
+  // non-wrapping segments.
+  auto track_segment = [&](uint32_t segment_start, uint32_t segment_end) {
+    if (is_8888 && convert_if_7e3_to_8888) {
+      uint32_t run_start = segment_start;
+      bool in_run = false;
+      for (uint32_t tile = segment_start; tile <= segment_end; ++tile) {
+        bool tile_is_7e3 = tile < segment_end && interlock_tile_is_7e3_[tile] != 0;
+        if (tile_is_7e3) {
+          if (!in_run) {
+            in_run = true;
+            run_start = tile;
+          }
+        } else if (in_run) {
+          in_run = false;
+          PixelShaderInterlockReinterpret7e3To8888(run_start, tile - run_start);
+          // DP1 diagnostics (#23).
+          static uint32_t converted_runs = 0;
+          static uint32_t converted_tiles = 0;
+          ++converted_runs;
+          converted_tiles += tile - run_start;
+          rex::stats::Set("gpu/rov/7e3_to_8888_runs", converted_runs);
+          rex::stats::Set("gpu/rov/7e3_to_8888_tiles", converted_tiles);
+          if (REXCVAR_GET(rov_7e3_track_log)) {
+            REXGPU_INFO("ROV 7e3 track: converted tiles [{}, +{}) 7e3 -> 8888 for an 8888 draw",
+                        run_start, tile - run_start);
+          }
+        }
+      }
+    }
+    std::memset(interlock_tile_is_7e3_ + segment_start, is_7e3 ? 1 : 0,
+                segment_end - segment_start);
+  };
+  uint32_t end_tiles = start_tiles + length_tiles;
+  track_segment(start_tiles, std::min(end_tiles, xenos::kEdramTileCount));
+  if (end_tiles > xenos::kEdramTileCount) {
+    track_segment(0, end_tiles - xenos::kEdramTileCount);
+  }
+}
+
+uint32_t RenderTargetCache::PixelShaderInterlockCount7e3Tiles(uint32_t start_tiles,
+                                                            uint32_t length_tiles) const {
+  uint32_t count = 0;
+  length_tiles = std::min(length_tiles, xenos::kEdramTileCount);
+  for (uint32_t i = 0; i < length_tiles; ++i) {
+    count += interlock_tile_is_7e3_[(start_tiles + i) & (xenos::kEdramTileCount - 1)] ? 1 : 0;
+  }
+  return count;
+}
+
+uint32_t RenderTargetCache::PixelShaderInterlockCountNon7e3Tiles(uint32_t start_tiles,
+                                                               uint32_t length_tiles) const {
+  length_tiles = std::min(length_tiles, xenos::kEdramTileCount);
+  return length_tiles - PixelShaderInterlockCount7e3Tiles(start_tiles, length_tiles);
 }
 
 RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(RenderTargetKey key) {

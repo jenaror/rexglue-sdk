@@ -16,6 +16,7 @@ add_library(rexcore OBJECT
     memory.cpp
     mutex.cpp
     ring_buffer.cpp
+    stats.cpp
     string_buffer.cpp
     threading.cpp
     timer_queue.cpp
@@ -39,6 +40,7 @@ if(WIN32)
         clock_win.cpp
         dbg_win.cpp
         dynlib_win.cpp
+        crash_handler_win.cpp
         exception_handler_win.cpp
         filesystem_win.cpp
         fiber_win32.cpp
@@ -134,4 +136,8 @@ if(REXGLUE_ENABLE_PERF_COUNTERS)
     target_sources(rexcore PRIVATE perf/counter.cpp)
     target_compile_definitions(rexcore PUBLIC
         $<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PERF_COUNTERS>)
+endif()
+
+if(WIN32)
+    target_link_libraries(rexcore PRIVATE dbghelp psapi)
 endif()

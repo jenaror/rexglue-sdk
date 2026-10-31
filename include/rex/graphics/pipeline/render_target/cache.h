@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -548,6 +549,32 @@ class RenderTargetCache {
   // EDRAM memory are committed with a memory barrier.
   void PixelShaderInterlockFullEdramBarrierPlaced();
 
+  // DP1 fix (pixel shader interlock): value-clipping 7e3 -> 8888 EDRAM
+  // reinterpretation, the ROV counterpart of the host render target ownership
+  // transfer fix. The cache remembers which tiles were last written as
+  // k_2_10_10_10_FLOAT(_AS_16_16_16_16) color; when such tiles get bound as
+  // k_8_8_8_8(_GAMMA) color for drawing, the implementation is asked to
+  // convert their contents in place (unpack 7e3, saturate, pack UNORM8) before
+  // the draw, so pixels the draw leaves untouched (alpha test / src.a == 0
+  // blending) hold clipped LDR color instead of 7e3 bit patterns read as UNORM8.
+  // start_tiles + length_tiles never wrap past xenos::kEdramTileCount.
+  virtual void PixelShaderInterlockReinterpret7e3To8888(uint32_t start_tiles,
+                                                        uint32_t length_tiles) {}
+  // Records the format class of the color (or depth, for which is_color is
+  // false) data written to the tile range, and, if convert_if_7e3_to_8888 is
+  // true (drawing, as opposed to clearing), requests the reinterpretation of
+  // the sub-ranges that still hold 7e3 data when binding them as 8888.
+  // DP1 diagnostics (2026-09-13, #23): number of tiles in [start, start + length)
+  // (wrapping) currently tagged as holding 7e3 color.
+  uint32_t PixelShaderInterlockCount7e3Tiles(uint32_t start_tiles, uint32_t length_tiles) const;
+  // Same for tiles tagged as NOT 7e3 (8888 / other / never written).
+  uint32_t PixelShaderInterlockCountNon7e3Tiles(uint32_t start_tiles,
+                                               uint32_t length_tiles) const;
+
+  void PixelShaderInterlockTrackTiles(uint32_t start_tiles, uint32_t length_tiles, bool is_color,
+                                      xenos::ColorRenderTargetFormat color_format,
+                                      bool convert_if_7e3_to_8888);
+
  private:
   const RegisterFile& register_file_;
   uint32_t draw_resolution_scale_x_;
@@ -660,6 +687,14 @@ class RenderTargetCache {
   // since standard containers use dynamic allocation for elements, though
   // changes to this throughout a frame are pretty rare.
   std::map<uint32_t, OwnershipRange> ownership_ranges_;
+
+  // DP1 fix (pixel shader interlock): per-tile "last written as 7e3 color"
+  // flags, see PixelShaderInterlockTrackTiles. Independent of
+  // ownership_ranges_, which the interlock path resets on every full barrier
+  // and which doesn't carry the real color format there.
+  uint8_t interlock_tile_is_7e3_[xenos::kEdramTileCount] = {};
+  // DP1 diagnostics: last "ROV bind" line, to log only changes.
+  std::string rov_bind_log_last_;
 
   // Render targets actually used by the draw call with the last successful
   // update. 0 is depth, color starting from 1, nullptr if not bound.

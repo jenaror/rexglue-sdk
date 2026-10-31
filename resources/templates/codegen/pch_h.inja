@@ -286,22 +286,29 @@ inline std::unordered_map<u32, jmp_buf>& get_jmp_buf_map() {
 // Trap Handling
 //=============================================================================
 
-inline void ppc_trap(PPCContext& ctx, u8* base, u16 trap_type) {
+// DP1 2026-09-13: `address` is the guest address of the trap instruction
+// (0 when the caller predates this signature). Type 22 is `twi 31,r0,22`,
+// the STL / CRT __debugbreak assert; type 0 is a conditional tw/twi
+// (division checks and the like). On the console both halt the title.
+inline void ppc_trap(PPCContext& ctx, u8* base, u16 trap_type, u32 address = 0) {
   switch (trap_type) {
     case 20:
     case 26: {
       auto str = REX_LOAD_STRING(ctx.r3.u32, ctx.r4.u16);
-      REXCPU_DEBUG("(service trap) {}", str);
+      REXCPU_DEBUG("(service trap) {} at 0x{:08X}", str, address);
       break;
     }
-    case 0:
     case 22:
-      REXCPU_WARN("tw/td trap hit (type {})", trap_type);
+      REXCPU_WARN("assert trap (twi 31,r0,22) at 0x{:08X}, lr 0x{:08X}, r3 0x{:08X} r4 0x{:08X}",
+                  address, u32(ctx.lr), ctx.r3.u32, ctx.r4.u32);
+      break;
+    case 0:
+      REXCPU_WARN("conditional trap hit at 0x{:08X}, lr 0x{:08X}", address, u32(ctx.lr));
       break;
     case 25:
       break;
     default:
-      REXCPU_WARN("Unknown trap type {}", trap_type);
+      REXCPU_WARN("Unknown trap type {} at 0x{:08X}", trap_type, address);
       break;
   }
 }

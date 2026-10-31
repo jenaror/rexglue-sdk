@@ -10,10 +10,13 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include <rex/input/device_assignment.h>
+#include <rex/input/guest_input_gate.h>  // [new_fix_28092026_upstream]
 #include <rex/input/input.h>
 #include <rex/input/input_driver.h>
 #include <rex/input/state_merge.h>
@@ -47,7 +50,21 @@ class InputSystem : public system::IInputSystem {
   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration);
   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags, X_INPUT_KEYSTROKE* out_keystroke);
 
+  // [new_fix_28092026_upstream] While any blocker is held (a XAM dialog is on
+  // screen) the guest reads a neutral pad; buttons still held when the last
+  // blocker drops stay masked until released.
+  void AddUIInputBlocker();
+  void RemoveUIInputBlocker();
+
  private:
+  // [new_fix_28092026_upstream] The merged state of a user's devices, before
+  // the dialog gate; GetState applies the gate and announces connection changes.
+  X_RESULT ReadMergedState(uint32_t user_index, X_INPUT_STATE* out_state);
+  void NoteConnection(uint32_t user_index, bool connected);
+  std::mutex gate_mutex_;
+  GuestInputGate gate_;
+  std::atomic<int> ui_input_blockers_{0};
+
   /// Re-enumerates every driver and notifies the assignment when the set
   /// changed.
   void RefreshDevices();

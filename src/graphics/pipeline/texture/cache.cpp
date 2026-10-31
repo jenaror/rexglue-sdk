@@ -10,7 +10,13 @@
  */
 
 #include <algorithm>
+#include <unordered_set>
+#include <array>
+#include <mutex>
+#include <set>
+#include <vector>
 #include <cstdint>
+#include <cstdlib>
 #include <utility>
 
 #include <rex/assert.h>
@@ -20,6 +26,7 @@
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/pipeline/texture/info.h>
+#include <rex/graphics/pipeline/texture/replacement.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/xenos.h>
@@ -246,6 +253,8 @@ bool TextureCache::GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out
   uint32_t clamped_y = std::min(kMaxDrawResolutionScaleAlongAxis, config_y);
   x_out = clamped_x;
   y_out = clamped_y;
+  REXGPU_INFO("Draw resolution scale: {}x{} (resolution_scale cvar {}, config {}x{})", clamped_x,
+              clamped_y, REXCVAR_GET(resolution_scale), config_x, config_y);
   return clamped_x == config_x && clamped_y == config_y;
 }
 
@@ -591,6 +600,41 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
   if (bindings_changed) {
     UpdateTextureBindingsImpl(bindings_changed);
   }
+  // DP1 diagnostics: texture_trace_hash = <16 hex> logs the raster/blend state
+  // of every draw that binds that texture (once per distinct state).
+  {
+    static uint64_t trace_hash = 0;
+    static bool trace_parsed = false;
+    if (!trace_parsed) {
+      trace_parsed = true;
+      const std::string h = REXCVAR_GET(texture_trace_hash);
+      if (h.size() >= 16) trace_hash = std::strtoull(h.substr(0, 16).c_str(), nullptr, 16);
+    }
+    if (trace_hash) {
+      for (uint32_t i = 0; i < 32; ++i) {
+        if (!(used_texture_mask & (uint32_t(1) << i))) continue;
+        const TextureBinding& b = texture_bindings_[i];
+        if (!b.texture || b.texture->data_hash() != trace_hash) continue;
+        const uint32_t blend0 = regs[XE_GPU_REG_RB_BLENDCONTROL0];
+        const uint32_t colorcontrol = regs[XE_GPU_REG_RB_COLORCONTROL];
+        const uint32_t colormask = regs[XE_GPU_REG_RB_COLOR_MASK];
+        const uint32_t depthcontrol = regs[XE_GPU_REG_RB_DEPTHCONTROL];
+        const uint32_t alpharef = regs[XE_GPU_REG_RB_ALPHA_REF];
+        const uint32_t colorinfo = regs[XE_GPU_REG_RB_COLOR_INFO];
+        const uint32_t modecontrol = regs[XE_GPU_REG_RB_MODECONTROL];
+        static std::mutex seen_mutex;
+        static std::set<std::array<uint32_t, 8>> seen;
+        std::array<uint32_t, 8> k = {i, blend0, colorcontrol, colormask, depthcontrol, alpharef, colorinfo, modecontrol};
+        std::lock_guard<std::mutex> lock(seen_mutex);
+        if (seen.insert(k).second) {
+          REXGPU_INFO("Texture trace {:016X}: fetch#{} blend0={:08X} colorcontrol={:08X} colormask={:08X} "
+                      "depthcontrol={:08X} alpharef={:08X} colorinfo={:08X} modecontrol={:08X}",
+                      trace_hash, i, blend0, colorcontrol, colormask, depthcontrol, alpharef, colorinfo,
+                      modecontrol);
+        }
+      }
+    }
+  }
 }
 
 const char* TextureCache::TextureKey::GetLogDimensionName(xenos::DataDimension dimension) {
@@ -867,6 +911,7 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   // Create the texture and add it to the map.
   Texture* texture;
   {
+    creating_data_hash_ = HashGuestTexture(key, creating_view_);
     std::unique_ptr<Texture> new_texture = CreateTexture(key);
     if (!new_texture) {
       key.LogAction("Failed to create");
@@ -874,10 +919,44 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     }
     assert_true(new_texture->key() == key);
     texture = textures_.emplace(key, std::move(new_texture)).first->second.get();
+    texture->SetDataHash(creating_data_hash_);
+    creating_data_hash_ = 0;
   }
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
   texture->LogAction("Created");
   return texture;
+}
+
+uint64_t TextureCache::HashGuestTexture(const TextureKey& key,
+                                        texture_replacement::GuestBaseView& view_out) const {
+  view_out = texture_replacement::GuestBaseView();
+  texture_replacement::Registry& registry = texture_replacement::Registry::Get();
+  if (!registry.active()) return 0;
+  if (!key.base_page || key.scaled_resolve || key.signed_separate ||
+      key.dimension != xenos::DataDimension::k2DOrStacked || key.GetDepthOrArraySize() != 1) {
+    return 0;
+  }
+  texture_util::TextureGuestLayout layout = key.GetGuestLayout();
+  // packed_level == 0 means the base itself lives inside the packed mip tail.
+  if (layout.packed_level == 0 || !layout.base.level_data_extent_bytes) return 0;
+  texture_replacement::GuestBaseView view;
+  view.data = shared_memory().guest_memory().TranslatePhysical<const uint8_t*>(key.base_page << 12);
+  view.size_bytes = layout.base.level_data_extent_bytes;
+  view.guest_address = key.base_page << 12;
+  view.width = key.GetWidth();
+  view.height = key.GetHeight();
+  view.format = key.format;
+  view.endian = key.endianness;
+  view.tiled = key.tiled != 0;
+  view.row_pitch_bytes = layout.base.row_pitch_bytes;
+  view.x_extent_blocks = layout.base.x_extent_blocks;
+  view.y_extent_blocks = layout.base.y_extent_blocks;
+  uint64_t hash = registry.Hash(view);
+  if (registry.dump_enabled()) {
+    registry.Dump(hash, view);
+  }
+  view_out = view;
+  return hash;
 }
 
 bool TextureCache::LoadTextureData(Texture& texture) {
@@ -911,14 +990,38 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
     case xenos::FetchConstantType::kTexture:
       break;
     case xenos::FetchConstantType::kInvalidTexture:
+      {
+        // DP1 (2026-09-06): Deadly Premonition binds the same three "invalid"
+        // fetch constants every frame, flooding the log at 3 lines per frame.
+        // Report each distinct constant once (small bounded set).
+        static std::mutex reported_mutex;
+        static std::vector<std::array<uint32_t, 6>> reported;
+        std::array<uint32_t, 6> words = {fetch.dword_0, fetch.dword_1, fetch.dword_2,
+                                         fetch.dword_3, fetch.dword_4, fetch.dword_5};
+        std::lock_guard<std::mutex> lock(reported_mutex);
+        if (std::find(reported.begin(), reported.end(), words) != reported.end()) {
+          return;
+        }
+        if (reported.size() < 64) {
+          reported.push_back(words);
+        }
+      }
       if (REXCVAR_GET(gpu_allow_invalid_fetch_constants)) {
+        // DP1 (2026-09-13): still say it once, so the log shows which
+        // constants are being honoured despite the "invalid" type.
+        REXGPU_INFO("Texture fetch constant ({:08X} {:08X} {:08X} {:08X} {:08X} {:08X}) has "
+                    "\"invalid\" type; honoured (gpu_allow_invalid_fetch_constants). Reported "
+                    "once per distinct constant.",
+                    fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4,
+                    fetch.dword_5);
         break;
       }
       REXGPU_WARN(
           "Texture fetch constant ({:08X} {:08X} {:08X} {:08X} {:08X} {:08X}) "
           "has \"invalid\" type! This is incorrect behavior, but you can try "
           "bypassing this by launching Xenia with "
-          "--gpu_allow_invalid_fetch_constants=true.",
+          "--gpu_allow_invalid_fetch_constants=true. (Reported once per distinct "
+          "constant.)",
           fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);
       return;
     default:
@@ -988,6 +1091,41 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
 
   if (swizzled_signs_out != nullptr) {
     *swizzled_signs_out = texture_util::SwizzleSigns(fetch);
+  }
+
+  // DP1 2026-09-14 (HDR audit): textures that carry HDR-relevant fetch state -
+  // a gamma (PWL) sign on any component, a non-zero exponent adjust, or a
+  // float / 10-11-11 format - once per distinct (format, signs, exp_adjust,
+  // num_format, size, base).
+  if (REXCVAR_GET(gpu_hdr_log)) {
+    const bool any_gamma = fetch.sign_x == xenos::TextureSign::kGamma ||
+                           fetch.sign_y == xenos::TextureSign::kGamma ||
+                           fetch.sign_z == xenos::TextureSign::kGamma ||
+                           fetch.sign_w == xenos::TextureSign::kGamma;
+    const bool float_format =
+        format == xenos::TextureFormat::k_16_16_16_16_FLOAT || format == xenos::TextureFormat::k_16_FLOAT ||
+        format == xenos::TextureFormat::k_16_16_FLOAT || format == xenos::TextureFormat::k_32_FLOAT ||
+        format == xenos::TextureFormat::k_32_32_FLOAT || format == xenos::TextureFormat::k_32_32_32_32_FLOAT ||
+        format == xenos::TextureFormat::k_10_11_11 || format == xenos::TextureFormat::k_11_11_10 ||
+        format == xenos::TextureFormat::k_2_10_10_10;
+    if (any_gamma || fetch.exp_adjust != 0 || float_format) {
+      static std::unordered_set<uint64_t> reported;
+      const uint64_t key = (uint64_t(uint32_t(format)) << 56) | (uint64_t(fetch.dword_0 & 0x3FF) << 44) |
+                           (uint64_t(uint32_t(fetch.exp_adjust) & 63) << 38) |
+                           (uint64_t(fetch.num_format) << 37) | (uint64_t(width_minus_1 & 0x1FFF) << 24) |
+                           (uint64_t(height_minus_1 & 0x1FFF) << 11) | uint64_t(base_page & 0x7FF);
+      if (reported.insert(key).second) {
+        static const char* kSign[] = {"u", "s", "b", "G"};
+        REXGPU_INFO(
+            "HDR texture: {} {}x{} at 0x{:08X}, signs {}{}{}{}, exp_adjust {}, num_format {}, "
+            "filters {}/{}/{}, aniso {} (first seen; gpu_hdr_log)",
+            FormatInfo::Get(format)->name, width_minus_1 + 1, height_minus_1 + 1, base_page << 12,
+            kSign[uint32_t(fetch.sign_x)], kSign[uint32_t(fetch.sign_y)], kSign[uint32_t(fetch.sign_z)],
+            kSign[uint32_t(fetch.sign_w)], int32_t(fetch.exp_adjust), uint32_t(fetch.num_format),
+            uint32_t(fetch.mag_filter), uint32_t(fetch.min_filter), uint32_t(fetch.mip_filter),
+            uint32_t(fetch.aniso_filter));
+      }
+    }
   }
 }
 

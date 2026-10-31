@@ -71,8 +71,10 @@ u32 XMACreateContext_entry(mapped_u32 context_out_ptr) {
   uint32_t context_ptr = xma_decoder->AllocateContext();
   *context_out_ptr = context_ptr;
   if (!context_ptr) {
+    REXKRNL_WARN("XMACreateContext: no free XMA context");
     return X_STATUS_NO_MEMORY;
   }
+  REXKRNL_DEBUG("XMACreateContext -> {:08X}", context_ptr);
   return X_STATUS_SUCCESS;
 }
 
@@ -81,6 +83,7 @@ u32 XMAReleaseContext_entry(mapped_void context_ptr) {
       static_cast<audio::AudioSystem*>(REX_KERNEL_STATE()->emulator()->audio_system())
           ->xma_decoder();
   xma_decoder->ReleaseContext(context_ptr.guest_address());
+  REXKRNL_DEBUG("XMAReleaseContext {:08X}", context_ptr.guest_address());
   return 0;
 }
 

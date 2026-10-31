@@ -21,6 +21,8 @@ REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
                     "Don't display any UI, using defaults for prompts as needed");
 #include <rex/kernel/xam/private.h>
 #include <rex/hook.h>
+#include <rex/input/input_system.h>  // [new_fix_28092026_upstream]
+#include <rex/runtime.h>
 #include <rex/types.h>
 #include <rex/system/xtypes.h>
 #include <rex/thread.h>
@@ -54,6 +56,36 @@ using namespace rex::system;
 
 extern std::atomic<int> xam_dialogs_shown_;
 
+namespace {
+
+// [new_fix_28092026_upstream] port of upstream 3cd7243: holds guest input for
+// as long as a dialog is on screen, so the title does not act on the presses
+// driving it (the keyboard is also a pad for the game), including the one that
+// dismisses it.
+class ScopedGuestInputBlock {
+ public:
+  ScopedGuestInputBlock() {
+    auto* runtime = REX_KERNEL_STATE() ? REX_KERNEL_STATE()->emulator() : nullptr;
+    input_system_ =
+        runtime ? static_cast<rex::input::InputSystem*>(runtime->input_system()) : nullptr;
+    if (input_system_) {
+      input_system_->AddUIInputBlocker();
+    }
+  }
+  ~ScopedGuestInputBlock() {
+    if (input_system_) {
+      input_system_->RemoveUIInputBlocker();
+    }
+  }
+  ScopedGuestInputBlock(const ScopedGuestInputBlock&) = delete;
+  ScopedGuestInputBlock& operator=(const ScopedGuestInputBlock&) = delete;
+
+ private:
+  rex::input::InputSystem* input_system_ = nullptr;
+};
+
+}  // namespace
+
 class XamDialog : public rex::ui::ImGuiDialog {
  public:
   void set_close_callback(std::function<void()> close_callback) {
@@ -81,6 +113,7 @@ X_RESULT xeXamDispatchDialog(T* dialog, std::function<X_RESULT(T*)> close_callba
     REX_KERNEL_STATE()->BroadcastNotification(0x9, true);
   };
   auto run = [dialog, close_callback]() -> X_RESULT {
+    ScopedGuestInputBlock input_block;  // [new_fix_28092026_upstream]
     X_RESULT result;
     dialog->set_close_callback(
         [&dialog, &result, &close_callback]() { result = close_callback(dialog); });
@@ -122,6 +155,7 @@ X_RESULT xeXamDispatchDialogEx(T* dialog,
     REX_KERNEL_STATE()->BroadcastNotification(0x9, true);
   };
   auto run = [dialog, close_callback](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+    ScopedGuestInputBlock input_block;  // [new_fix_28092026_upstream]
     rex::ui::WindowedAppContext* app_context = REX_KERNEL_STATE()->emulator()->app_context();
     X_RESULT result;
     dialog->set_close_callback([&dialog, &result, &extended_error, &length, &close_callback]() {

@@ -76,6 +76,11 @@ class ObjectTable {
   }
 
   std::vector<object_ref<XObject>> GetAllObjects();
+
+  // Counts live entries without blocking: returns false when the global
+  // critical region is held by someone else (the periodic [stats] line must
+  // never wait on a lock a hung guest thread may own).
+  bool TryCountObjects(uint32_t* out_count);
   void PurgeAllObjects();  // Purges the object table of all guest objects
 
  private:

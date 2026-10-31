@@ -17,6 +17,8 @@
 
 #include <cstring>
 
+#include <rex/stats.h>
+
 namespace rex::debug {
 
 // Returns true if a debugger is attached to this process.
@@ -82,11 +84,13 @@ void DebugPrint(fmt::string_view format, const Args&... args) {
 #define PROFILE_FIBER_LEAVE
 #endif
 
-// Counter profiling -- plot to Tracy
-#define COUNT_profile_set(name, value)              \
-  do {                                              \
-    if (TracyIsStarted)                             \
-      TracyPlot(name, static_cast<int64_t>(value)); \
+// Counter profiling -- plot to Tracy, and keep the latest value in the
+// rex::stats gauge table for the periodic [stats] log line.
+#define COUNT_profile_set(name, value)                    \
+  do {                                                    \
+    ::rex::stats::Set(name, static_cast<int64_t>(value)); \
+    if (TracyIsStarted)                                   \
+      TracyPlot(name, static_cast<int64_t>(value));       \
   } while (0)
 
 #else  // !REXGLUE_ENABLE_PROFILING
@@ -107,7 +111,8 @@ void DebugPrint(fmt::string_view format, const Args&... args) {
 #define PROFILE_FIBER_ENTER(name)
 #define PROFILE_FIBER_LEAVE
 
-// Counter profiling stubs
-#define COUNT_profile_set(name, value)
+// Counter profiling: no Tracy, but the gauge still feeds the [stats] line.
+#define COUNT_profile_set(name, value) \
+  ::rex::stats::Set(name, static_cast<int64_t>(value))
 
 #endif  // REXGLUE_ENABLE_PROFILING

@@ -74,10 +74,10 @@ struct LogConfig {
   const char* log_file = nullptr;
 
   /** spdlog pattern string for the stdout console sink. */
-  std::string console_pattern = "[%^%l%$] [%n] [t%t] %v";
+  std::string console_pattern = "[%^%l%$] [%n] [%*] [f%~] %v";
 
   /** spdlog pattern string for the file sink. */
-  std::string file_pattern = "[%Y-%m-%d %H:%M:%S.%e] [%l] [%n] [t%t] %v";
+  std::string file_pattern = "[%Y-%m-%d %H:%M:%S.%e] [%l] [%n] [%*] [f%~] %v";
 
   /** Messages at or above this level trigger an immediate flush. */
   spdlog::level::level_enum flush_level = spdlog::level::info;

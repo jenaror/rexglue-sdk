@@ -181,6 +181,22 @@ void XThread::set_name(const std::string_view name) {
     // One the thread is ready it will handle it.
     thread_->set_name(thread_name_);
   }
+  if (XThread::IsInThread(this)) {
+    rex::SetCurrentThreadLogName(name);
+    REXSYS_INFO("Guest thread named: '{}' (handle {:08X}, id {})", name, handle(), thread_id_);
+  }
+}
+
+thread_local std::string t_pending_guest_thread_name;
+
+void XThread::SetPendingGuestThreadName(std::string_view name) {
+  t_pending_guest_thread_name.assign(name.data(), name.size());
+}
+
+std::string XThread::TakePendingGuestThreadName() {
+  std::string name = std::move(t_pending_guest_thread_name);
+  t_pending_guest_thread_name.clear();
+  return name;
 }
 
 static uint8_t next_cpu = 0;
@@ -441,6 +457,7 @@ X_STATUS XThread::Create() {
 
     // Set name immediately, if we have one.
     thread_->set_name(thread_name_);
+    rex::SetCurrentThreadLogName(thread_name_);
 
     PROFILE_THREAD_ENTER(thread_name_.c_str());
     PROFILE_THREAD_CREATED();
@@ -537,6 +554,8 @@ X_STATUS XThread::Exit(int exit_code) {
   ReleaseHandle();
 
   // NOTE: this does not return!
+  REXSYS_INFO("Guest thread exiting: '{}' (handle {:08X}) code {}", thread_name_, handle(),
+              exit_code);
   rex::thread::Thread::Exit(exit_code);
   return X_STATUS_SUCCESS;
 }
@@ -569,8 +588,8 @@ X_STATUS XThread::Terminate(int exit_code) {
 }
 
 void XThread::Execute() {
-  REXSYS_NOISY_DEBUG("Execute thid {} (handle={:08X}, '{}', native={:08X})", thread_id_, handle(),
-                     thread_name_, thread_->system_id());
+  REXSYS_INFO("Guest thread started: '{}' (handle {:08X}, id {}, native {:08X})", thread_name_,
+              handle(), thread_id_, thread_->system_id());
 
   // Let the kernel know we are starting.
   kernel_state_->OnThreadExecute(this);

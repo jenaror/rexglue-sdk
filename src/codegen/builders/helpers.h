@@ -442,7 +442,7 @@ inline void emitVectorTempEA(BuilderContext& ctx) {
 //=============================================================================
 
 /**
- * Emit a PPC trap instruction: if (<condition>) ppc_trap(ctx, base, 0);
+ * Emit a PPC trap instruction: if (<condition>) ppc_trap(ctx, base, 0, <guest address>);
  *
  * @param to       5-bit TO field
  * @param aSigned  First operand, signed (e.g., "ctx.r3.s32")
@@ -456,7 +456,7 @@ inline void emitTrap(BuilderContext& ctx, uint32_t to, const std::string& aSigne
   if (to == 0)
     return;
   if (to == 0x1F) {
-    ctx.println("\tppc_trap(ctx, base, 0);");
+    ctx.println("\tppc_trap(ctx, base, 0, 0x{:08X});", ctx.base);
     return;
   }
 
@@ -477,7 +477,7 @@ inline void emitTrap(BuilderContext& ctx, uint32_t to, const std::string& aSigne
   if (to & 0x01)
     add(fmt::format("{} > {}", aUnsigned, bUnsigned));
 
-  ctx.println("\tif ({}) ppc_trap(ctx, base, 0);", cond);
+  ctx.println("\tif ({}) ppc_trap(ctx, base, 0, 0x{:08X});", cond, ctx.base);
 }
 
 }  // namespace rex::codegen

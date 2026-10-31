@@ -11,12 +11,20 @@ add_executable(unit_tests
     core/hash_test.cpp
     core/stream_test.cpp
     core/chrono_test.cpp
+    core/stats_test.cpp
+    core/texture_copy_clamp_test.cpp
+    core/log_dir_budget_test.cpp
     ppc/import_function_test.cpp
     ppc/stack_test.cpp
     system/guest_path_test.cpp
     system/achievement_manager_test.cpp
+    system/content_dir_ops_test.cpp
     system/function_dispatcher_test.cpp
     input/input_assignment_test.cpp
+    input/state_filter_test.cpp
+    input/stick_mapping_test.cpp
+    input/guest_input_gate_test.cpp
+    audio/output_layout_test.cpp
     codegen/codegen_writer_test.cpp
     codegen/output_partition_test.cpp
     codegen/output_stamp_test.cpp
@@ -36,6 +44,7 @@ target_include_directories(unit_tests PRIVATE
 target_link_libraries(unit_tests PRIVATE
     rexcodegen
     rexruntime
+    xxHash::xxhash
     Catch2::Catch2WithMain
 )
 

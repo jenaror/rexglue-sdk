@@ -16,6 +16,7 @@
 #include <rex/audio/xma/decoder.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
+#include <rex/stats.h>
 #include <rex/math.h>
 #include <rex/memory/ring_buffer.h>
 #include <rex/stream.h>
@@ -252,6 +253,13 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
   memory::store_and_swap<uint32_t>(memory()->TranslateVirtual(ptr), callback_arg);
 
   clients_[index] = {driver, callback, callback_arg, ptr, true};
+  {
+    int64_t in_use = 0;
+    for (const auto& client : clients_) {
+      in_use += client.in_use ? 1 : 0;
+    }
+    rex::stats::Set("audio/clients", in_use);
+  }
 
   if (out_index) {
     *out_index = index;
@@ -284,6 +292,13 @@ void AudioSystem::UnregisterClient(size_t index) {
   DestroyDriver(clients_[index].driver);
   memory()->SystemHeapFree(clients_[index].wrapped_callback_arg);
   clients_[index] = {nullptr, 0, 0, 0, false};
+  {
+    int64_t in_use = 0;
+    for (const auto& client : clients_) {
+      in_use += client.in_use ? 1 : 0;
+    }
+    rex::stats::Set("audio/clients", in_use);
+  }
 
   // Drain the semaphore of its count.
   auto client_semaphore = client_semaphores_[index].get();

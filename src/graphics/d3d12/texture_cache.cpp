@@ -10,11 +10,14 @@
  */
 
 #include <algorithm>
+#include <unordered_set>
 #include <array>
 #include <cfloat>
 #include <cstddef>
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <utility>
 
 #include <rex/assert.h>
@@ -26,7 +29,9 @@
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/xenos.h>
+#include <rex/graphics/texture_copy_clamp.h>
 #include <rex/logging.h>
+#include <rex/stats.h>
 #include <rex/perf/counter.h>
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
@@ -988,6 +993,27 @@ D3D12TextureCache::SamplerParameters D3D12TextureCache::GetSamplerParameters(
   }
   parameters.mip_base_map = mip_base_map;
 
+  // DP1 diagnostics (texture_dump = true): every sampler that is not fully
+  // linear is logged once per (texture, parameters) so point-filtered
+  // textures can be matched with the dumped PNGs by guest address.
+  if (REXCVAR_GET(texture_dump) && !(parameters.mag_linear && parameters.min_linear)) {
+    static std::mutex seen_mutex;
+    static std::set<uint64_t> seen;
+    const uint64_t seen_key = (uint64_t(fetch.base_address) << 32) | parameters.value;
+    std::lock_guard<std::mutex> lock(seen_mutex);
+    if (seen.insert(seen_key).second) {
+      uint32_t w1 = 0, h1 = 0, d1 = 0, bp = 0, mp = 0;
+      texture_util::GetSubresourcesFromFetchConstant(fetch, &w1, &h1, &d1, &bp, &mp, nullptr, nullptr);
+      const FormatInfo* fi = FormatInfo::Get(fetch.format);
+      REXGPU_INFO("Sampler non-linear: fetch#{} base {:08X} {}x{} {} mag={} min={} mip={} "
+                  "(shader mag={} min={} mip={}) aniso={} mips {}..{}",
+                  binding.fetch_constant, bp << 12, w1 + 1, h1 + 1, fi ? fi->name : "?",
+                  uint32_t(mag_filter), uint32_t(min_filter), uint32_t(mip_filter),
+                  uint32_t(binding.mag_filter), uint32_t(binding.min_filter),
+                  uint32_t(binding.mip_filter), uint32_t(aniso_filter), mip_min_level, mip_max_level);
+    }
+  }
+
   return parameters;
 }
 
@@ -1523,6 +1549,16 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
     unsupported_format_features_used_[uint32_t(key.format)] |= kUnsupportedResourceBit;
     return nullptr;
   }
+  // Texture replacement: a host PNG stands in for the guest texture.
+  const texture_replacement::Image* replacement = nullptr;
+  uint32_t replacement_mip_count = 0;
+  if (creating_data_hash_ && key.dimension == xenos::DataDimension::k2DOrStacked &&
+      key.GetDepthOrArraySize() == 1 && !key.scaled_resolve && !key.signed_separate) {
+    replacement = texture_replacement::Registry::Get().Find(creating_data_hash_, &creating_view_);
+    if (replacement) {
+      replacement_mip_count = std::min(uint32_t(replacement->levels.size()), uint32_t(key.mip_max_level + 1));
+    }
+  }
   if (key.dimension == xenos::DataDimension::k3D) {
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
   } else {
@@ -1530,14 +1566,21 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
   }
   desc.Alignment = 0;
-  desc.Width = key.GetWidth();
-  desc.Height = key.GetHeight();
-  if (key.scaled_resolve) {
-    desc.Width *= draw_resolution_scale_x();
-    desc.Height *= draw_resolution_scale_y();
+  {
+    const rex::gpu::texture_copy::Extent2 host_extent = rex::gpu::texture_copy::HostResourceExtent(
+        key.GetWidth(), key.GetHeight(), key.scaled_resolve != 0, draw_resolution_scale_x(),
+        draw_resolution_scale_y());
+    desc.Width = host_extent.width;
+    desc.Height = host_extent.height;
   }
   desc.DepthOrArraySize = key.GetDepthOrArraySize();
   desc.MipLevels = key.mip_max_level + 1;
+  if (replacement) {
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.Width = replacement->width;
+    desc.Height = replacement->height;
+    desc.MipLevels = replacement_mip_count;
+  }
   desc.SampleDesc.Count = 1;
   desc.SampleDesc.Quality = 0;
   desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
@@ -1554,13 +1597,174 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
                                              resource_state, nullptr, IID_PPV_ARGS(&resource)))) {
     return nullptr;
   }
-  return std::unique_ptr<Texture>(new D3D12Texture(*this, key, resource.Get(), resource_state));
+  D3D12Texture* texture = new D3D12Texture(*this, key, resource.Get(), resource_state);
+  if (replacement) {
+    texture->SetReplacement(replacement, replacement_mip_count);
+    REXGPU_INFO("Texture replacement: {:016X} {}x{} -> host {}x{} ({} mips)", creating_data_hash_,
+                key.GetWidth(), key.GetHeight(), replacement->width, replacement->height,
+                replacement_mip_count);
+  }
+  return std::unique_ptr<Texture>(texture);
+}
+
+
+// DP1 2026-09-13 (DPRecomp #22): a CopyTextureRegion whose source extent is
+// larger than the destination mip level is an invalid call that removes the
+// device (seen in the field: a 64x64 source into a 32x32 level of an
+// R8G8B8A8 texture). Clamp the copy to the level and log the texture once, so
+// the frame survives and the log names the texture instead of the crash.
+namespace {
+// Returns 0 when the copy fits (box untouched), 1 when it was clamped and
+// already reported for this texture+level, 2 when clamped and reported now.
+int DP1ClampCopyToSubresource(ID3D12Resource* dst, uint32_t dst_subresource,
+                              const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& src_footprint,
+                              const D3D12_BOX* src_box, D3D12_BOX& clamped_box_out,
+                              const char* site, uint64_t texture_id, uint32_t level,
+                              uint32_t guest_base_address) {
+  namespace tc = rex::gpu::texture_copy;
+  D3D12_RESOURCE_DESC desc = dst->GetDesc();
+  const uint32_t mip = tc::MipFromSubresource(dst_subresource, desc.MipLevels);
+  // Block-compressed levels are addressed in whole blocks: a 4x4 BC block into
+  // a 2x2 or 1x1 level is a legal copy (1.3.5 clamped those to an unaligned
+  // box and removed the device itself - #22 log 4).
+  uint32_t block_width, block_height;
+  tc::BlockSizeForDxgiFormat(desc.Format, block_width, block_height);
+  const tc::Extent level_extent =
+      tc::LevelExtent(uint32_t(desc.Width), desc.Height, desc.DepthOrArraySize, mip,
+                      desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D, block_width,
+                      block_height);
+  tc::Box box;
+  if (src_box) {
+    box = {src_box->left, src_box->top, src_box->front, src_box->right, src_box->bottom,
+           src_box->back};
+  } else {
+    box = {0, 0, 0, src_footprint.Footprint.Width, src_footprint.Footprint.Height,
+           src_footprint.Footprint.Depth};
+  }
+  const uint32_t src_w = box.Width(), src_h = box.Height(), src_d = box.Depth();
+  if (!tc::ClampBoxToLevel(box, level_extent)) {
+    return 0;
+  }
+  static std::unordered_set<uint64_t> reported;
+  static uint32_t clamped_total = 0;
+  ++clamped_total;
+  rex::stats::Set("gpu/texture_cache/copies_clamped", clamped_total);
+  const bool first = reported.insert(tc::ReportKey(texture_id, level)).second;
+  if (first) {
+    REXGPU_ERROR(
+        "{}: copy of {}x{}x{} into level {} of a {}x{}x{} (mips {}, format {}, block {}x{}) "
+        "texture at guest 0x{:08X}, level size {}x{}x{} - clamped to {}x{}x{} (DPRecomp #22; "
+        "this would remove the device)",
+        site, src_w, src_h, src_d, mip, uint32_t(desc.Width), desc.Height,
+        uint32_t(desc.DepthOrArraySize), desc.MipLevels, uint32_t(desc.Format), block_width,
+        block_height, guest_base_address, level_extent.width, level_extent.height,
+        level_extent.depth, box.Width(), box.Height(), box.Depth());
+  }
+  clamped_box_out.left = box.left;
+  clamped_box_out.top = box.top;
+  clamped_box_out.front = box.front;
+  clamped_box_out.right = box.right;
+  clamped_box_out.bottom = box.bottom;
+  clamped_box_out.back = box.back;
+  return first ? 2 : 1;
+}
+}  // namespace
+
+bool D3D12TextureCache::UploadReplacementTexture(D3D12Texture& texture) {
+  const texture_replacement::Image& image = *texture.replacement();
+  uint32_t mip_count = texture.replacement_mip_count();
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+  DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
+
+  // Placed footprints for every level in one upload buffer.
+  std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(mip_count);
+  UINT64 total = 0;
+  for (uint32_t level = 0; level < mip_count; ++level) {
+    uint32_t w = image.LevelWidth(level), h = image.LevelHeight(level);
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT& fp = footprints[level];
+    fp.Offset = total;
+    fp.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    fp.Footprint.Width = w;
+    fp.Footprint.Height = h;
+    fp.Footprint.Depth = 1;
+    fp.Footprint.RowPitch = rex::align(w * 4, uint32_t(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT));
+    total += rex::align(UINT64(fp.Footprint.RowPitch) * h,
+                        UINT64(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT));
+  }
+
+  // The upload buffer is created once per texture and kept (small UI
+  // textures; the contents never change).
+  Microsoft::WRL::ComPtr<ID3D12Resource>& upload = texture.replacement_upload();
+  if (!upload) {
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = total;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_UNKNOWN;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                               D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                               IID_PPV_ARGS(&upload)))) {
+      REXGPU_ERROR("Texture replacement: failed to create the upload buffer");
+      return false;
+    }
+    void* mapped = nullptr;
+    D3D12_RANGE read_range = {0, 0};
+    if (FAILED(upload->Map(0, &read_range, &mapped))) {
+      upload.Reset();
+      return false;
+    }
+    for (uint32_t level = 0; level < mip_count; ++level) {
+      uint32_t w = image.LevelWidth(level), h = image.LevelHeight(level);
+      const std::vector<uint8_t>& src = image.levels[level];
+      uint8_t* dst = static_cast<uint8_t*>(mapped) + footprints[level].Offset;
+      for (uint32_t y = 0; y < h; ++y) {
+        std::memcpy(dst + size_t(y) * footprints[level].Footprint.RowPitch,
+                    src.data() + size_t(y) * w * 4, size_t(w) * 4);
+      }
+    }
+    upload->Unmap(0, nullptr);
+  }
+
+  texture.MarkAsUsed();
+  ID3D12Resource* resource = texture.resource();
+  command_processor_.PushTransitionBarrier(
+      resource, texture.SetResourceState(D3D12_RESOURCE_STATE_COPY_DEST),
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  command_processor_.SubmitBarriers();
+  D3D12_TEXTURE_COPY_LOCATION location_source, location_dest;
+  location_source.pResource = upload.Get();
+  location_source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  location_dest.pResource = resource;
+  location_dest.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  for (uint32_t level = 0; level < mip_count; ++level) {
+    location_source.PlacedFootprint = footprints[level];
+    location_dest.SubresourceIndex = level;
+    D3D12_BOX clamped_box;
+    const D3D12_BOX* box_ptr = nullptr;
+    if (DP1ClampCopyToSubresource(resource, level, footprints[level], nullptr, clamped_box,
+                                  "Texture replacement upload",
+                                  TextureCache::TextureKey::Hasher()(texture.key()), level,
+                                  texture.key().base_page << 12)) {
+      box_ptr = &clamped_box;
+    }
+    command_list.D3DCopyTextureRegion(&location_dest, 0, 0, 0, &location_source, box_ptr);
+  }
+  return true;
 }
 
 bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                               bool load_mips) {
   D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
   TextureKey texture_key = d3d12_texture.key();
+  if (d3d12_texture.replacement()) {
+    return UploadReplacementTexture(d3d12_texture);
+  }
 
   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
   ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
@@ -1924,7 +2128,31 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
       source_box_ptr = nullptr;
     }
     for (uint32_t slice = 0; slice < array_size; ++slice) {
-      command_list.D3DCopyTextureRegion(&location_dest, 0, 0, 0, &location_source, source_box_ptr);
+      D3D12_BOX clamped_box;
+      const D3D12_BOX* slice_box_ptr = source_box_ptr;
+      const int clamp_result = DP1ClampCopyToSubresource(
+          texture_resource, location_dest.SubresourceIndex, location_source.PlacedFootprint,
+          source_box_ptr, clamped_box, "Texture load",
+          TextureCache::TextureKey::Hasher()(texture_key), level, texture_key.base_page << 12);
+      if (clamp_result == 2) {
+        // Once per texture and level (the guard just reported it): the guest
+        // side of the layout, to match the texture in a dump.
+        REXGPU_ERROR(
+            "Texture load: guest 0x{:08X} {}x{}x{} format {} mips {} packed level {} scaled {} "
+            "slice {} - level {} layout {}x{} box {}",
+            texture_key.base_page << 12, width, height, depth, uint32_t(guest_format),
+            texture_level_count, level_packed, texture_resolution_scaled, slice, level,
+            location_source.PlacedFootprint.Footprint.Width,
+            location_source.PlacedFootprint.Footprint.Height,
+            source_box_ptr ? fmt::format("[{},{})x[{},{})", source_box_ptr->left,
+                                         source_box_ptr->right, source_box_ptr->top,
+                                         source_box_ptr->bottom)
+                           : std::string("full"));
+      }
+      if (clamp_result) {
+        slice_box_ptr = &clamped_box;
+      }
+      command_list.D3DCopyTextureRegion(&location_dest, 0, 0, 0, &location_source, slice_box_ptr);
       location_dest.SubresourceIndex += texture_level_count;
       location_source.PlacedFootprint.Offset += host_slice_size;
     }
@@ -1982,6 +2210,13 @@ ID3D12Resource* D3D12TextureCache::D3D12Texture::GetOrCreate3DAs2DResource(
   auto& d3d12_cache = static_cast<D3D12TextureCache&>(texture_cache());
 
   if (texture_3d_as_2d_) {
+    // DP1 2026-09-14 (DPRecomp #22 follow-up): the wrapper has its own
+    // memory watch, but nothing reloaded it once it existed - a scaled-resolve
+    // texture rewritten every frame showed its first frame forever through 2D
+    // sampling. LoadTextureData is a no-op unless the range was rewritten.
+    if (texture_3d_as_2d_->outdated_mask() && !d3d12_cache.LoadTextureData(*texture_3d_as_2d_)) {
+      REXGPU_ERROR("D3D12TextureCache: Failed to reload 3D-as-2D wrapper data");
+    }
     d3d12_cache.command_processor_.PushTransitionBarrier(
         texture_3d_as_2d_->resource(), texture_3d_as_2d_->SetResourceState(end_state), end_state);
     return texture_3d_as_2d_->resource();
@@ -1993,8 +2228,17 @@ ID3D12Resource* D3D12TextureCache::D3D12Texture::GetOrCreate3DAs2DResource(
   D3D12_RESOURCE_DESC desc = {};
   desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
   desc.Alignment = 0;
-  desc.Width = key().GetWidth();
-  desc.Height = key().GetHeight();
+  // DP1 2026-09-14 (DPRecomp #22, log 5): the wrapper keeps the key's
+  // scaled_resolve, so the loader uploads the scaled layout - the resource
+  // must be scaled the same way CreateTexture scales it (was the guest size:
+  // a 64x64 upload into a 32x32 level, device removed).
+  {
+    const rex::gpu::texture_copy::Extent2 host_extent = rex::gpu::texture_copy::HostResourceExtent(
+        key().GetWidth(), key().GetHeight(), key().scaled_resolve != 0,
+        d3d12_cache.draw_resolution_scale_x(), d3d12_cache.draw_resolution_scale_y());
+    desc.Width = host_extent.width;
+    desc.Height = host_extent.height;
+  }
   desc.DepthOrArraySize = 1;
   desc.MipLevels = 1;
   desc.Format = d3d12_cache.GetDXGIResourceFormat(key());
@@ -2075,6 +2319,10 @@ uint32_t D3D12TextureCache::FindOrCreateTextureDescriptor(D3D12Texture& texture,
   }
 
   uint32_t mip_levels = texture_key.mip_max_level + 1;
+  if (texture.replacement()) {
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    mip_levels = texture.replacement_mip_count();
+  }
   ID3D12Resource* resource_for_view = texture.resource();
   switch (dimension) {
     case xenos::DataDimension::k3D:

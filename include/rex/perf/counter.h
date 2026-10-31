@@ -15,6 +15,11 @@
 
 #ifdef REXGLUE_ENABLE_PROFILING
 #include <tracy/Tracy.hpp>
+
+#include <rex/cvar.h>
+
+REXCVAR_DECLARE(bool, tracy_enable);
+REXCVAR_DECLARE(std::string, perf_log_csv);
 #endif
 
 namespace rex::perf {

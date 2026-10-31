@@ -93,12 +93,51 @@ void SyncMemory() {
   MemoryBarrier();
 }
 
+// DP1 2026-09-06 (DPRecomp #12): ::Sleep(ms) is quantised to the system timer
+// period (up to 15.6 ms unless somebody called timeBeginPeriod), so a guest
+// frame limiter that sleeps for "the rest of the 16.67 ms" overshoots by
+// whole milliseconds and the game runs below its target rate. Use a
+// high-resolution waitable timer (Windows 10 1803+, ~0.5 ms accuracy) when
+// the OS provides one and fall back to ::Sleep otherwise.
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+namespace {
+struct HighResolutionSleepTimer {
+  HANDLE handle = nullptr;
+  bool tried = false;
+  HANDLE Get() {
+    if (!tried) {
+      tried = true;
+      handle = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                      TIMER_ALL_ACCESS);
+    }
+    return handle;
+  }
+  ~HighResolutionSleepTimer() {
+    if (handle) {
+      CloseHandle(handle);
+    }
+  }
+};
+}  // namespace
+
 void Sleep(std::chrono::microseconds duration) {
   if (duration.count() < 100) {
     MaybeYield();
-  } else {
-    ::Sleep(static_cast<DWORD>(duration.count() / 1000));
+    return;
   }
+  thread_local HighResolutionSleepTimer timer;
+  if (HANDLE h = timer.Get()) {
+    LARGE_INTEGER due;
+    due.QuadPart = -static_cast<LONGLONG>(duration.count()) * 10;  // 100 ns units, relative
+    if (SetWaitableTimer(h, &due, 0, nullptr, nullptr, FALSE)) {
+      WaitForSingleObject(h, INFINITE);
+      return;
+    }
+  }
+  ::Sleep(static_cast<DWORD>(duration.count() / 1000));
 }
 
 SleepResult AlertableSleep(std::chrono::microseconds duration) {

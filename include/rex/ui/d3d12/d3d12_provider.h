@@ -35,6 +35,9 @@ class D3D12Provider : public GraphicsProvider {
   // nullptr if PIX not attached.
   IDXGraphicsAnalysis* GetGraphicsAnalysis() const { return graphics_analysis_; }
   ID3D12Device* GetDevice() const { return device_; }
+  // DP1 diagnostics: drains the debug layer's stored messages into the log
+  // (no-op unless d3d12_debug is on). Called once per frame by the swap.
+  void LogDebugLayerMessages() const;
   ID3D12CommandQueue* GetDirectQueue() const { return direct_queue_; }
 
   uint32_t GetDescriptorSize(D3D12_DESCRIPTOR_HEAP_TYPE type) const {
@@ -138,6 +141,8 @@ class D3D12Provider : public GraphicsProvider {
 
   HMODULE library_d3d12_ = nullptr;
   PFN_D3D12_GET_DEBUG_INTERFACE pfn_d3d12_get_debug_interface_;
+  ID3D12InfoQueue* debug_info_queue_ = nullptr;
+  IDXGIInfoQueue* dxgi_debug_info_queue_ = nullptr;
   PFN_D3D12_CREATE_DEVICE pfn_d3d12_create_device_;
   PFN_D3D12_SERIALIZE_ROOT_SIGNATURE pfn_d3d12_serialize_root_signature_;
 
@@ -151,6 +156,9 @@ class D3D12Provider : public GraphicsProvider {
   DxcCreateInstanceProc pfn_dxcompiler_dxc_create_instance_ = nullptr;
 
   IDXGIFactory2* dxgi_factory_ = nullptr;
+  // DP1 2026-09-13: the adapter the device was created on, for the VRAM
+  // budget line in [stats]. May be nullptr on adapters without IDXGIAdapter3.
+  IDXGIAdapter3* dxgi_adapter3_ = nullptr;
   ID3D12Device* device_ = nullptr;
   ID3D12CommandQueue* direct_queue_ = nullptr;
   IDXGraphicsAnalysis* graphics_analysis_ = nullptr;

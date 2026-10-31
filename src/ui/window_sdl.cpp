@@ -474,9 +474,24 @@ void WindowSDL::HandleWindowEvent(SDL_Event& event) {
       break;
     }
     case SDL_EVENT_WINDOW_FOCUS_GAINED:
+      // DP1 (2026-09-06): after Alt+Tab back into a borderless fullscreen
+      // window, the Windows shell sometimes keeps the taskbar above it (the
+      // "rude app" detection is not re-run on plain activation). Re-assert
+      // fullscreen so SDL issues a fresh SetWindowPos over the monitor rect.
+      // Re-entering fullscreen is a no-op inside SDL when the window is already
+      // fullscreen, so hold the window above the taskbar with always-on-top
+      // while it is focused and drop the flag when focus leaves (other apps
+      // must be able to cover the game after Alt+Tab).
+      if (IsFullscreen() && (SDL_GetWindowFlags(sdl_window_) & SDL_WINDOW_FULLSCREEN)) {
+        SDL_SetWindowAlwaysOnTop(sdl_window_, true);
+        SDL_RaiseWindow(sdl_window_);
+      }
       OnFocusUpdate(true, destruction_receiver);
       break;
     case SDL_EVENT_WINDOW_FOCUS_LOST:
+      if (SDL_GetWindowFlags(sdl_window_) & SDL_WINDOW_ALWAYS_ON_TOP) {
+        SDL_SetWindowAlwaysOnTop(sdl_window_, false);
+      }
       OnFocusUpdate(false, destruction_receiver);
       break;
     case SDL_EVENT_WINDOW_EXPOSED:

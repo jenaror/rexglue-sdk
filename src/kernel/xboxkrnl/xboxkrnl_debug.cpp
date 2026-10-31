@@ -140,12 +140,18 @@ void RtlRaiseException_entry(ppc_ptr_t<X_EXCEPTION_RECORD> record) {
 
   // TODO(benvanik): unwinding.
   // This is going to suck.
+  REXKRNL_ERROR("RtlRaiseException: code {:#x} flags {:#x} address {:08X} - unhandled, breaking",
+                static_cast<uint32_t>(record->code), static_cast<uint32_t>(record->exception_flags),
+                static_cast<uint32_t>(record->exception_address));
+  rex::FlushLogging();
   rex::debug::Break();
 }
 
 void KeBugCheckEx_entry(u32 code, u32 param1, u32 param2, u32 param3, u32 param4) {
-  REXKRNL_DEBUG("*** STOP: 0x{:08X} (0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X})", code, param1, param2,
-                param3, param4);
+  REXKRNL_ERROR("*** KeBugCheck STOP: 0x{:08X} (0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}) - the game "
+                "reported a fatal error (0xF4 = heap corruption, 0xF5 = D3D)",
+                code, param1, param2, param3, param4);
+  rex::FlushLogging();
   fflush(stdout);
   rex::debug::Break();
   assert_always();

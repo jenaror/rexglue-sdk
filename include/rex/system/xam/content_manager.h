@@ -152,8 +152,12 @@ class ContentManager {
                                                  const XCONTENT_AGGREGATE_DATA& data);
 
   bool ContentExists(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
+  /// The package directory exists, is a directory and is not mounted (DPRecomp #21 reuse path).
+  bool ContentDirectoryUsable(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
+  /// reuse_directory: accept an already existing package directory (the
+  /// overwrite path when the old directory could not be removed, DPRecomp #21).
   X_RESULT CreateContent(const std::string_view root_name, uint64_t xuid,
-                         const XCONTENT_AGGREGATE_DATA& data);
+                         const XCONTENT_AGGREGATE_DATA& data, bool reuse_directory = false);
   X_RESULT OpenContent(const std::string_view root_name, uint64_t xuid,
                        const XCONTENT_AGGREGATE_DATA& data, uint32_t& content_license);
   X_RESULT CloseContent(const std::string_view root_name);

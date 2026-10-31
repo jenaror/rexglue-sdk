@@ -194,6 +194,16 @@ void RemoveSink(spdlog::sink_ptr sink);
 void RemoveSink(LogCategoryId category, spdlog::sink_ptr sink);
 
 /**
+ * DP1 diagnostics: the guest thread name printed by the `%*` pattern flag for
+ * every line logged from the calling thread (host threads print "host").
+ */
+void SetCurrentThreadLogName(std::string_view name);
+
+/** DP1 diagnostics: the frame number printed by the `%~` pattern flag. */
+void SetFrameNumber(uint32_t frame);
+uint32_t GetFrameNumber();
+
+/**
  * Replace the global console sink on every registered logger with `sink`.
  * Pass nullptr to remove the console sink without replacement.
  *

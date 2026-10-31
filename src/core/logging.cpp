@@ -18,6 +18,9 @@
 #include <vector>
 
 #include <spdlog/sinks/rotating_file_sink.h>
+#include <rex/logging/log_dir_budget.h>  // [new_fix_28092026_upstream]
+#include <spdlog/pattern_formatter.h>
+#include <atomic>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
 #include <toml++/toml.hpp>
@@ -44,12 +47,19 @@ REXCVAR_DEFINE_BOOL(log_verbose, false, "Log", "Enable verbose logging (sets lev
 
 REXCVAR_DEFINE_BOOL(log_noisy, false, "Log", "Enable noisy/high-frequency log macros");
 
-REXCVAR_DEFINE_INT32(log_flush_interval, 0, "Log", "Periodic flush interval in seconds (0 = off)")
+REXCVAR_DEFINE_INT32(log_flush_interval, 5, "Log", "Periodic flush interval in seconds (0 = off)")
     .range(0, 60)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_INT32(log_max_file_size_mb, 5, "Log", "Max log file size in MB before rotation")
     .range(1, 100)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+// [new_fix_28092026_upstream] port of upstream b971840: bound the logs directory.
+REXCVAR_DEFINE_INT32(log_dir_budget_mb, 256, "Log",
+                     "Size limit of the logs directory in MB: at start the oldest runs (a log and "
+                     "its rotated parts) are removed until the rest fits (0 = unlimited)")
+    .range(0, 100000)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_INT32(log_max_files, 20, "Log", "Max number of rotated log files to keep")
@@ -131,6 +141,48 @@ spdlog::level::level_enum ResolveCategoryLevel(const std::string& name) {
   return g_config.default_level;
 }
 
+// ---------------------------------------------------------------------------
+// DP1 diagnostics: per-thread guest name and a global frame number, exposed as
+// custom spdlog pattern flags `%*` and `%~`.
+// ---------------------------------------------------------------------------
+thread_local std::string t_thread_log_name;
+std::atomic<uint32_t> g_frame_number{0};
+
+class ThreadNameFlag : public spdlog::custom_flag_formatter {
+ public:
+  void format(const spdlog::details::log_msg& msg, const std::tm&,
+              spdlog::memory_buf_t& dest) override {
+    if (t_thread_log_name.empty()) {
+      char buf[24];
+      int n = std::snprintf(buf, sizeof(buf), "host:%zu", msg.thread_id);
+      dest.append(buf, buf + (n > 0 ? n : 0));
+    } else {
+      dest.append(t_thread_log_name.data(), t_thread_log_name.data() + t_thread_log_name.size());
+    }
+  }
+  std::unique_ptr<custom_flag_formatter> clone() const override {
+    return spdlog::details::make_unique<ThreadNameFlag>();
+  }
+};
+
+class FrameNumberFlag : public spdlog::custom_flag_formatter {
+ public:
+  void format(const spdlog::details::log_msg&, const std::tm&, spdlog::memory_buf_t& dest) override {
+    char buf[16];
+    int n = std::snprintf(buf, sizeof(buf), "%u", g_frame_number.load(std::memory_order_relaxed));
+    dest.append(buf, buf + (n > 0 ? n : 0));
+  }
+  std::unique_ptr<custom_flag_formatter> clone() const override {
+    return spdlog::details::make_unique<FrameNumberFlag>();
+  }
+};
+
+void ApplyPattern(const spdlog::sink_ptr& sink, const std::string& pattern) {
+  auto formatter = std::make_unique<spdlog::pattern_formatter>();
+  formatter->add_flag<ThreadNameFlag>('*').add_flag<FrameNumberFlag>('~').set_pattern(pattern);
+  sink->set_formatter(std::move(formatter));
+}
+
 // Create a logger and register it
 std::shared_ptr<spdlog::logger> CreateCategoryLogger(const std::string& name) {
   auto sinks = BuildCategorySinks(name);
@@ -176,7 +228,7 @@ void InitLoggingEarly() {
 }
 
 void InitLogging(const LogConfig& config) {
-  std::lock_guard lock(g_mutex);
+  std::unique_lock lock(g_mutex);  // [new_fix_28092026_upstream] released before the prune line
 
   if (g_initialized) {
     g_config = config;
@@ -212,17 +264,23 @@ void InitLogging(const LogConfig& config) {
   if (config.log_to_console) {
     auto sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
     sink->set_level(spdlog::level::trace);
-    sink->set_pattern(config.console_pattern);
+    ApplyPattern(sink, config.console_pattern);
     g_console_sink = sink;
   }
 
   // File sink (rotating) with sequential naming fallback
   std::string resolved_path;
+  rex::logging::PruneResult prune_result;  // [new_fix_28092026_upstream]
   if (config.log_file) {
     resolved_path = config.log_file;
   } else if (!config.app_name.empty()) {
     auto log_dir = config.log_dir.empty() ? std::filesystem::current_path() / "logs"
                                           : std::filesystem::path(config.log_dir);
+    // [new_fix_28092026_upstream] before the new run's file exists
+    std::error_code prune_ec;
+    std::filesystem::create_directories(log_dir, prune_ec);
+    prune_result = rex::logging::PruneLogDirectory(
+        log_dir, config.app_name, uint64_t(REXCVAR_GET(log_dir_budget_mb)) * 1024 * 1024);
     resolved_path = NextSequentialLogPath(log_dir, config.app_name).string();
   }
   if (!resolved_path.empty()) {
@@ -230,7 +288,7 @@ void InitLogging(const LogConfig& config) {
         resolved_path, static_cast<size_t>(REXCVAR_GET(log_max_file_size_mb)) * 1024 * 1024,
         static_cast<size_t>(REXCVAR_GET(log_max_files)), false);
     sink->set_level(spdlog::level::trace);
-    sink->set_pattern(config.file_pattern);
+    ApplyPattern(sink, config.file_pattern);
     g_file_sink = sink;
   }
 
@@ -260,6 +318,15 @@ void InitLogging(const LogConfig& config) {
   int flush_interval = REXCVAR_GET(log_flush_interval);
   if (flush_interval > 0)
     spdlog::flush_every(std::chrono::seconds(flush_interval));
+
+  // [new_fix_28092026_upstream] the logger lookups take g_mutex
+  lock.unlock();
+  if (prune_result.removed_files > 0) {
+    REXLOG_INFO("Log directory over {} MB: removed the {} oldest run(s), {} file(s), {:.1f} MB; {:.1f} MB kept",
+                REXCVAR_GET(log_dir_budget_mb), prune_result.removed_runs, prune_result.removed_files,
+                double(prune_result.removed_bytes) / (1024.0 * 1024.0),
+                double(prune_result.kept_bytes) / (1024.0 * 1024.0));
+  }
 }
 
 void InitLogging(const char* log_file, spdlog::level::level_enum level) {
@@ -560,5 +627,11 @@ std::map<std::string, std::string> ParseCategoryLevelsFromConfig(
 
   return result;
 }
+
+void SetCurrentThreadLogName(std::string_view name) { t_thread_log_name.assign(name.data(), name.size()); }
+
+void SetFrameNumber(uint32_t frame) { g_frame_number.store(frame, std::memory_order_relaxed); }
+
+uint32_t GetFrameNumber() { return g_frame_number.load(std::memory_order_relaxed); }
 
 }  // namespace rex

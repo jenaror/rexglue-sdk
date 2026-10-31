@@ -53,6 +53,7 @@ class XexModule : public Module {
     uint32_t load_address;
     uint32_t page_descriptor_count;
     const xex2_page_descriptor* page_descriptors;
+    uint32_t region = 0;  // xex2_region_flags of the image (XGetGameRegion), DP1 #27
   };
   enum XexFormat {
     kFormatUnknown,
