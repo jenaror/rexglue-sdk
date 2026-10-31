@@ -61,6 +61,9 @@ elseif(UNIX)
     target_sources(rexcore PRIVATE
         atomic_posix.cpp
         clock_posix.cpp
+        # DP mac port: the non-Windows branch of this file defines no-op
+        # rex::crash stubs, which rex_app.cpp links against.
+        crash_handler_win.cpp
         dbg_posix.cpp
         dynlib_posix.cpp
         exception_handler_posix.cpp

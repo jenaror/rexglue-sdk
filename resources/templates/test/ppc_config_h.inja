@@ -143,7 +143,9 @@ inline std::unordered_map<u32, jmp_buf>& get_jmp_buf_map() {
 // Trap Handling
 //=============================================================================
 
-inline void ppc_trap(PPCContext& ctx, u8* base, u16 trap_type) {
+// DP mac port: matches codegen/pch_h.inja, whose DP1 change made the
+// recompiler pass the trap's guest address as a fourth argument.
+inline void ppc_trap(PPCContext& ctx, u8* base, u16 trap_type, u32 address = 0) {
   switch (trap_type) {
     case 20:
     case 26: {

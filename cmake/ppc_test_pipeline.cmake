@@ -3,8 +3,10 @@
 # Provides ppc_add_test_binary() for assembling, linking, and generating
 # symbol maps from PPC assembly test files.
 
-# Locate PPC toolchain in tools/ directory
-set(PPC_TOOLS_DIR "${PROJECT_SOURCE_DIR}/tools/binutils")
+# Locate PPC toolchain in tools/ directory. The bundled binaries are Windows
+# and Linux only; on macOS point this at a locally built VMX128 binutils.
+set(PPC_TOOLS_DIR "${PROJECT_SOURCE_DIR}/tools/binutils" CACHE PATH
+    "Directory holding powerpc-none-elf-{as,ld,nm} with -mvmx128 support")
 
 if(WIN32)
     set(PPC_ASSEMBLER "${PPC_TOOLS_DIR}/powerpc-none-elf-as.exe")

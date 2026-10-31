@@ -12,7 +12,6 @@ add_executable(unit_tests
     core/stream_test.cpp
     core/chrono_test.cpp
     core/stats_test.cpp
-    core/texture_copy_clamp_test.cpp
     core/log_dir_budget_test.cpp
     ppc/import_function_test.cpp
     ppc/stack_test.cpp
@@ -34,6 +33,12 @@ target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/ui.cpp
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/progress.cpp
 )
+
+# DP mac port: texture_copy_clamp.h needs dxgiformat.h and only serves the
+# D3D12 texture cache.
+if(WIN32)
+    target_sources(unit_tests PRIVATE core/texture_copy_clamp_test.cpp)
+endif()
 
 target_include_directories(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/include
