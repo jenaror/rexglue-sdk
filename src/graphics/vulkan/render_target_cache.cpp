@@ -3650,6 +3650,25 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
             builder.createStore(
                 builder.createCompositeConstruct(type_fragment_data, id_vector_temp),
                 output_fragment_data);
+          } else if (dest_is_color &&
+                     (dest_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
+                      dest_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA)) {
+            // DP mac port: Vulkan copy of the DP1 D3D12 fix (LittleBitUA,
+            // 2026-06-20): HDR 7e3 -> 8888 ownership transfer with
+            // value-clipping instead of bit-preservation. The raw 7e3 bits
+            // unpacked as UNORM8 leak through Deadly Premonition's tonemap and
+            // alpha-blend passes as rainbow speckles and false-colour sky and
+            // ground; the HDR floats saturated to [0, 1] look like the tonemap
+            // output instead.
+            id_vector_temp.clear();
+            for (uint32_t i = 0; i < 4; ++i) {
+              id_vector_temp.push_back(builder.createTriBuiltinCall(
+                  type_float, ext_inst_glsl_std_450, GLSLstd450NClamp, source_color[0][i],
+                  builder.makeFloatConstant(0.0f), builder.makeFloatConstant(1.0f)));
+            }
+            builder.createStore(
+                builder.createCompositeConstruct(type_fragment_data, id_vector_temp),
+                output_fragment_data);
           } else {
             // Float16 has a wider range for both color and alpha, also NaNs -
             // clamp and convert.
