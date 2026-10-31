@@ -1422,6 +1422,29 @@ bool RenderTargetCache::WouldOwnershipChangeRequireTransfers(RenderTargetKey des
   return false;
 }
 
+void RenderTargetCache::GetOwnedEndTiles(const RenderTargetKey* keys, uint32_t key_count,
+                                         uint32_t* end_tiles_out) const {
+  std::fill(end_tiles_out, end_tiles_out + key_count, uint32_t(0));
+  for (const auto& [range_start, range] : ownership_ranges_) {
+    for (uint32_t i = 0; i < key_count; ++i) {
+      RenderTargetKey key = keys[i];
+      if (range.render_target != key && range.host_depth_render_target_unorm24 != key &&
+          range.host_depth_render_target_float24 != key) {
+        continue;
+      }
+      // Relative to the base, with EDRAM addressing wrapping - a range
+      // crossing the base also covers the end of the render target.
+      uint32_t start_relative =
+          (range_start + xenos::kEdramTileCount - key.base_tiles) % xenos::kEdramTileCount;
+      uint32_t last_relative =
+          (range.end_tiles - 1 + xenos::kEdramTileCount - key.base_tiles) % xenos::kEdramTileCount;
+      end_tiles_out[i] =
+          std::max(end_tiles_out[i],
+                   start_relative <= last_relative ? last_relative + 1 : xenos::kEdramTileCount);
+    }
+  }
+}
+
 void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_tiles_base_relative,
                                         uint32_t length_tiles,
                                         std::vector<Transfer>* transfers_append_out,

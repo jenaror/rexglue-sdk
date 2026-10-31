@@ -497,6 +497,12 @@ class RenderTargetCache {
     assert_true(GetPath() == Path::kHostRenderTargets);
     return last_update_transfers_;
   }
+  // DP mac port: for each of the keys, the end, in tiles from its base, of the
+  // EDRAM it currently owns or holds the host depth of. Contents of a host
+  // render target past that are never read - only such tiles are transferred,
+  // resolved or dumped - so a host may skip storing them.
+  void GetOwnedEndTiles(const RenderTargetKey* keys, uint32_t key_count,
+                        uint32_t* end_tiles_out) const;
 
   HostDepthStoreRenderTargetConstant GetHostDepthStoreRenderTargetConstant(
       uint32_t pitch_tiles, bool msaa_2x_supported) const {

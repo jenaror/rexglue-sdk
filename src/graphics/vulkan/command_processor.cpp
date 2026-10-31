@@ -69,6 +69,13 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "device (falls back to render passes otherwise)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// DP mac port: see DeferredCommandBuffer::TrackRenderAreaOfLastBegin.
+REXCVAR_DEFINE_BOOL(vulkan_tight_render_area, true, "GPU/Vulkan",
+                    "Shrink each render target cache render pass to the area its draws and "
+                    "clears touch instead of the whole EDRAM-sized framebuffer (tile-based GPUs "
+                    "load and store the whole render area of every pass)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics::vulkan {
 
 namespace {
@@ -3158,6 +3165,10 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
                                                   VK_SUBPASS_CONTENTS_INLINE);
   }
+  // DP mac port: the dirty width / height from the TODO above.
+  if (REXCVAR_GET(vulkan_tight_render_area)) {
+    deferred_command_buffer_.TrackRenderAreaOfLastBegin();
+  }
   in_render_pass_ = true;
 }
 
@@ -3249,6 +3260,9 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     render_pass_begin_info.pClearValues = nullptr;
     deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
                                                   VK_SUBPASS_CONTENTS_INLINE);
+  }
+  if (REXCVAR_GET(vulkan_tight_render_area)) {
+    deferred_command_buffer_.TrackRenderAreaOfLastBegin();
   }
   in_render_pass_ = true;
 }
@@ -4114,6 +4128,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       render_target_cache_->last_update_render_pass(),
       render_target_cache_->last_update_framebuffer());
+
+  // DP mac port: guest draws often leave the scissor at 8192x8192 and the host
+  // viewport is the whole framebuffer, so bound the render area by the rows
+  // the bound render targets own instead (the rest of them is never read).
+  if (host_render_targets_used && REXCVAR_GET(vulkan_tight_render_area)) {
+    deferred_command_buffer_.SetNextDrawMaxY(render_target_cache_->GetLastUpdateOwnedMaxY());
+  }
 
   // Draw.
   if (primitive_processing_result.index_buffer_type ==

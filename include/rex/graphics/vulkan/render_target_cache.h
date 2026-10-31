@@ -115,6 +115,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   RenderPassKey last_update_render_pass_key() const { return last_update_render_pass_key_; }
   VkRenderPass last_update_render_pass() const { return last_update_render_pass_; }
   const Framebuffer* last_update_framebuffer() const { return last_update_framebuffer_; }
+  // DP mac port: the framebuffer row (exclusive) below which no render target
+  // bound by the last update owns EDRAM, UINT32_MAX if none is bound.
+  uint32_t GetLastUpdateOwnedMaxY() const;
   void GetLastUpdateRenderingAttachments(VkRenderingAttachmentInfo* color_attachments,
                                          uint32_t* color_attachment_count_out,
                                          VkRenderingAttachmentInfo* depth_attachment,

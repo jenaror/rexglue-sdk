@@ -1559,6 +1559,32 @@ void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
   *color_attachment_count_out = color_attachment_count;
 }
 
+uint32_t VulkanRenderTargetCache::GetLastUpdateOwnedMaxY() const {
+  RenderTargetKey keys[1 + xenos::kMaxColorRenderTargets];
+  uint32_t key_count = 0;
+  RenderTarget* const* render_targets = last_update_accumulated_render_targets();
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    if (render_targets[i]) {
+      keys[key_count++] = render_targets[i]->key();
+    }
+  }
+  if (!key_count) {
+    return UINT32_MAX;
+  }
+  uint32_t owned_end_tiles[1 + xenos::kMaxColorRenderTargets];
+  GetOwnedEndTiles(keys, key_count, owned_end_tiles);
+  uint32_t max_y = 0;
+  for (uint32_t i = 0; i < key_count; ++i) {
+    uint32_t pitch_tiles = std::max(keys[i].GetPitchTiles(), uint32_t(1));
+    uint32_t owned_tile_rows = (owned_end_tiles[i] + pitch_tiles - 1) / pitch_tiles;
+    max_y = std::max(max_y, owned_tile_rows *
+                                (xenos::kEdramTileHeightSamples >>
+                                 uint32_t(keys[i].msaa_samples >= xenos::MsaaSamples::k2X)) *
+                                draw_resolution_scale_y());
+  }
+  return max_y;
+}
+
 VkRenderPass VulkanRenderTargetCache::GetHostRenderTargetsRenderPass(RenderPassKey key) {
   assert_true(GetPath() == Path::kHostRenderTargets);
 
@@ -5091,6 +5117,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         if (!transfer_rectangle_write_ptr) {
           continue;
         }
+        // The scissor covers the whole framebuffer - bound the render area
+        // tracking by the rectangles instead.
+        uint32_t transfer_max_y = 0;
         for (auto it_merged = it_merged_first; it_merged <= it_merged_last; ++it_merged) {
           Transfer::Rectangle transfer_invocation_rectangles[Transfer::kMaxRectanglesWithCutout];
           uint32_t transfer_invocation_rectangle_count = it_merged->transfer.GetRectangles(
@@ -5099,6 +5128,8 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
           assert_not_zero(transfer_invocation_rectangle_count);
           for (uint32_t j = 0; j < transfer_invocation_rectangle_count; ++j) {
             const Transfer::Rectangle& transfer_rectangle = transfer_invocation_rectangles[j];
+            transfer_max_y = std::max(
+                transfer_max_y, transfer_rectangle.y_pixels + transfer_rectangle.height_pixels);
             float transfer_rectangle_x0 = -1.0f + transfer_rectangle.x_pixels * pixels_to_ndc_x;
             float transfer_rectangle_y0 = -1.0f + transfer_rectangle.y_pixels * pixels_to_ndc_y;
             float transfer_rectangle_x1 =
@@ -5288,6 +5319,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
               command_buffer.CmdVkSetStencilWriteMask(VK_STENCIL_FACE_FRONT_AND_BACK,
                                                       transfer_stencil_bit);
             }
+            command_buffer.SetNextDrawMaxY(transfer_max_y * draw_resolution_scale_y());
             command_buffer.CmdVkDraw(transfer_vertex_count, 1, 0, 0);
           }
         }

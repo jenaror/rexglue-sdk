@@ -30,6 +30,55 @@ DeferredCommandBuffer::DeferredCommandBuffer(const VulkanCommandProcessor& comma
 
 void DeferredCommandBuffer::Reset() {
   command_stream_.clear();
+  last_begin_args_offset_ = SIZE_MAX;
+  render_area_tracking_ = false;
+  tracked_clear_rects_.clear();
+  current_scissor_known_ = false;
+  current_viewport_known_ = false;
+  next_draw_max_y_ = UINT32_MAX;
+}
+
+void DeferredCommandBuffer::TrackRenderAreaOfLastBegin() {
+  if (last_begin_args_offset_ == SIZE_MAX) {
+    return;
+  }
+  const VkRect2D& render_area = RenderAreaOfLastBegin();
+  // The Metal render target size is the far corner of the render area, so
+  // only areas starting at the origin are shrunk.
+  if (render_area.offset.x || render_area.offset.y) {
+    return;
+  }
+  render_area_tracking_ = true;
+  tracked_render_area_limit_ = render_area.extent;
+  tracked_right_ = 0;
+  tracked_bottom_ = 0;
+  tracked_clear_rects_.clear();
+}
+
+VkRect2D& DeferredCommandBuffer::RenderAreaOfLastBegin() {
+  uintmax_t* args = command_stream_.data() + last_begin_args_offset_;
+  return last_begin_is_dynamic_rendering_
+             ? reinterpret_cast<ArgsVkBeginRendering*>(args)->render_area
+             : reinterpret_cast<ArgsVkBeginRenderPass*>(args)->render_area;
+}
+
+void DeferredCommandBuffer::FinishRenderAreaTracking() {
+  if (!render_area_tracking_) {
+    return;
+  }
+  render_area_tracking_ = false;
+  const uint8_t* stream_bytes = reinterpret_cast<const uint8_t*>(command_stream_.data());
+  for (const auto& [rects_offset_bytes, rect_count] : tracked_clear_rects_) {
+    const auto* rects = reinterpret_cast<const VkClearRect*>(stream_bytes + rects_offset_bytes);
+    for (uint32_t i = 0; i < rect_count; ++i) {
+      ExtendTrackedRenderArea(rects[i].rect);
+    }
+  }
+  tracked_clear_rects_.clear();
+  VkRect2D& render_area = RenderAreaOfLastBegin();
+  // A pass with nothing drawn still needs a non-empty area.
+  render_area.extent.width = std::clamp(tracked_right_, 1u, tracked_render_area_limit_.width);
+  render_area.extent.height = std::clamp(tracked_bottom_, 1u, tracked_render_area_limit_.height);
 }
 
 void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
@@ -374,6 +423,7 @@ void DeferredCommandBuffer::CmdVkPipelineBarrier(
 
 void DeferredCommandBuffer::CmdVkBeginRendering(const VkRenderingInfo* rendering_info) {
   assert_null(rendering_info->pNext);
+  FinishRenderAreaTracking();
 
   size_t arguments_size =
       rex::align(sizeof(ArgsVkBeginRendering), alignof(VkRenderingAttachmentInfo));
@@ -411,6 +461,8 @@ void DeferredCommandBuffer::CmdVkBeginRendering(const VkRenderingInfo* rendering
     std::memcpy(args_ptr + stencil_attachment_offset, rendering_info->pStencilAttachment,
                 sizeof(VkRenderingAttachmentInfo));
   }
+  last_begin_args_offset_ = size_t(reinterpret_cast<uintmax_t*>(args_ptr) - command_stream_.data());
+  last_begin_is_dynamic_rendering_ = true;
 }
 
 void* DeferredCommandBuffer::WriteCommand(Command command, size_t arguments_size_bytes) {

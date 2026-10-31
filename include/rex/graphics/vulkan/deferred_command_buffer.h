@@ -10,9 +10,12 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 #include <rex/assert.h>
@@ -31,10 +34,25 @@ class DeferredCommandBuffer {
   void Reset();
   void Execute(VkCommandBuffer command_buffer);
 
+  // DP mac port: a tile-based GPU (Apple, through MoltenVK) loads and stores
+  // the whole render area of every render pass, and the render target cache's
+  // framebuffers are as tall as the EDRAM - 2048 rows for a 720-row image,
+  // up to 8192 for narrow ones. When a tracked pass ends, its recorded render
+  // area is shrunk to the bottom-right corner of everything drawn in it (the
+  // dynamic scissor and viewport of each draw, further bounded by
+  // SetNextDrawMaxY, and the clear rectangles). Call right after the
+  // CmdVkBeginRendering / CmdVkBeginRenderPass of a pass whose draws all use
+  // the dynamic scissor and viewport.
+  void TrackRenderAreaOfLastBegin();
+  // For the render area tracking, the row (exclusive) below which the next
+  // draw changes nothing that is ever read, if known.
+  void SetNextDrawMaxY(uint32_t max_y) { next_draw_max_y_ = max_y; }
+
   // render_pass_begin->pNext of all barriers must be null.
   void CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,
                             VkSubpassContents contents) {
     assert_null(render_pass_begin->pNext);
+    FinishRenderAreaTracking();
     size_t arguments_size = sizeof(ArgsVkBeginRenderPass);
     uint32_t clear_value_count = render_pass_begin->clearValueCount;
     size_t clear_values_offset = 0;
@@ -55,6 +73,9 @@ class DeferredCommandBuffer {
       std::memcpy(args_ptr + clear_values_offset, render_pass_begin->pClearValues,
                   sizeof(VkClearValue) * clear_value_count);
     }
+    last_begin_args_offset_ =
+        size_t(reinterpret_cast<uintmax_t*>(args_ptr) - command_stream_.data());
+    last_begin_is_dynamic_rendering_ = false;
   }
 
   void CmdVkBindDescriptorSets(VkPipelineBindPoint pipeline_bind_point, VkPipelineLayout layout,
@@ -133,6 +154,13 @@ class DeferredCommandBuffer {
     args.rect_count = rect_count;
     attachments_out = reinterpret_cast<VkClearAttachment*>(args_ptr + attachments_offset);
     rects_out = reinterpret_cast<VkClearRect*>(args_ptr + rects_offset);
+    if (render_area_tracking_) {
+      // The caller fills the rectangles after this returns - read them when
+      // the pass ends.
+      tracked_clear_rects_.emplace_back(
+          size_t(args_ptr - reinterpret_cast<uint8_t*>(command_stream_.data())) + rects_offset,
+          rect_count);
+    }
   }
   void CmdVkClearAttachments(uint32_t attachment_count, const VkClearAttachment* attachments,
                              uint32_t rect_count, const VkClearRect* rects) {
@@ -239,6 +267,7 @@ class DeferredCommandBuffer {
     args.instance_count = instance_count;
     args.first_vertex = first_vertex;
     args.first_instance = first_instance;
+    ExtendTrackedRenderAreaByDraw();
   }
 
   void CmdVkDrawIndexed(uint32_t index_count, uint32_t instance_count, uint32_t first_index,
@@ -250,6 +279,7 @@ class DeferredCommandBuffer {
     args.first_index = first_index;
     args.vertex_offset = vertex_offset;
     args.first_instance = first_instance;
+    ExtendTrackedRenderAreaByDraw();
   }
 
   void CmdVkEndQuery(VkQueryPool query_pool, uint32_t query) {
@@ -259,11 +289,17 @@ class DeferredCommandBuffer {
     args.query = query;
   }
 
-  void CmdVkEndRenderPass() { WriteCommand(Command::kVkEndRenderPass, 0); }
+  void CmdVkEndRenderPass() {
+    FinishRenderAreaTracking();
+    WriteCommand(Command::kVkEndRenderPass, 0);
+  }
 
   // Dynamic rendering (VK_KHR_dynamic_rendering / Vulkan 1.3).
   void CmdVkBeginRendering(const VkRenderingInfo* rendering_info);
-  void CmdVkEndRendering() { WriteCommand(Command::kVkEndRendering, 0); }
+  void CmdVkEndRendering() {
+    FinishRenderAreaTracking();
+    WriteCommand(Command::kVkEndRendering, 0);
+  }
 
   void CmdVkResetQueryPool(VkQueryPool query_pool, uint32_t first_query, uint32_t query_count) {
     auto& args = *reinterpret_cast<ArgsVkResetQueryPool*>(
@@ -317,6 +353,10 @@ class DeferredCommandBuffer {
     args.first_scissor = first_scissor;
     args.scissor_count = scissor_count;
     std::memcpy(args_ptr + header_size, scissors, sizeof(VkRect2D) * scissor_count);
+    if (first_scissor == 0 && scissor_count) {
+      current_scissor_ = scissors[0];
+      current_scissor_known_ = true;
+    }
   }
 
   void CmdVkSetStencilCompareMask(VkStencilFaceFlags face_mask, uint32_t compare_mask) {
@@ -349,6 +389,10 @@ class DeferredCommandBuffer {
     args.first_viewport = first_viewport;
     args.viewport_count = viewport_count;
     std::memcpy(args_ptr + header_size, viewports, sizeof(VkViewport) * viewport_count);
+    if (first_viewport == 0 && viewport_count) {
+      current_viewport_ = viewports[0];
+      current_viewport_known_ = true;
+    }
   }
 
  private:
@@ -579,10 +623,59 @@ class DeferredCommandBuffer {
 
   void* WriteCommand(Command command, size_t arguments_size_bytes);
 
+  // Render area tracking (TrackRenderAreaOfLastBegin).
+  VkRect2D& RenderAreaOfLastBegin();
+  void ExtendTrackedRenderArea(const VkRect2D& rect) {
+    tracked_right_ = std::max(tracked_right_, uint32_t(rect.offset.x) + rect.extent.width);
+    tracked_bottom_ = std::max(tracked_bottom_, uint32_t(rect.offset.y) + rect.extent.height);
+  }
+  void ExtendTrackedRenderAreaByDraw() {
+    uint32_t draw_max_y = next_draw_max_y_;
+    next_draw_max_y_ = UINT32_MAX;
+    if (!render_area_tracking_) {
+      return;
+    }
+    if (!current_scissor_known_ || !current_viewport_known_) {
+      tracked_right_ = tracked_render_area_limit_.width;
+      tracked_bottom_ = tracked_render_area_limit_.height;
+      return;
+    }
+    // Primitives are also clipped to the viewport - rounded out, plus a pixel
+    // for line rasterization.
+    float viewport_right = current_viewport_.x + std::max(current_viewport_.width, 0.0f);
+    float viewport_bottom = current_viewport_.y + std::max(current_viewport_.height, 0.0f);
+    uint32_t right = uint32_t(current_scissor_.offset.x) + current_scissor_.extent.width;
+    uint32_t bottom = uint32_t(current_scissor_.offset.y) + current_scissor_.extent.height;
+    if (viewport_right < float(right)) {
+      right = uint32_t(std::max(std::ceil(viewport_right), 0.0f)) + 1;
+    }
+    if (viewport_bottom < float(bottom)) {
+      bottom = uint32_t(std::max(std::ceil(viewport_bottom), 0.0f)) + 1;
+    }
+    tracked_right_ = std::max(tracked_right_, right);
+    tracked_bottom_ = std::max(tracked_bottom_, std::min(bottom, draw_max_y));
+  }
+  void FinishRenderAreaTracking();
+
   const VulkanCommandProcessor& command_processor_;
 
   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
   std::vector<uintmax_t> command_stream_;
+
+  // Offsets are in command_stream_ elements, except for the clear rectangles
+  // (bytes), since the stream may be reallocated while a pass is recorded.
+  size_t last_begin_args_offset_ = SIZE_MAX;
+  bool last_begin_is_dynamic_rendering_ = false;
+  bool render_area_tracking_ = false;
+  VkExtent2D tracked_render_area_limit_ = {};
+  uint32_t tracked_right_ = 0;
+  uint32_t tracked_bottom_ = 0;
+  std::vector<std::pair<size_t, uint32_t>> tracked_clear_rects_;
+  VkRect2D current_scissor_ = {};
+  bool current_scissor_known_ = false;
+  VkViewport current_viewport_ = {};
+  bool current_viewport_known_ = false;
+  uint32_t next_draw_max_y_ = UINT32_MAX;
 };
 
 }  // namespace rex::graphics::vulkan
