@@ -45,6 +45,8 @@ struct PathConfig {
   std::filesystem::path cache_root;
   std::filesystem::path metadata_root;
   std::filesystem::path config_path;
+  // Log files and crash reports, <exe dir>/logs by default.
+  std::filesystem::path log_root;
 };
 
 namespace ui {

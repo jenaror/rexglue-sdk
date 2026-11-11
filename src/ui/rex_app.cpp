@@ -147,8 +147,10 @@ bool ReXApp::SetupEnvironment() {
     metadata_dir = metadata_root_cvar;
   }
 
-  PathConfig path_config{game_dir,  user_dir,     update_dir,
-                         cache_dir, metadata_dir, exe_dir / (std::string(GetName()) + ".toml")};
+  PathConfig path_config{game_dir,        user_dir,
+                         update_dir,      cache_dir,
+                         metadata_dir,    exe_dir / (std::string(GetName()) + ".toml"),
+                         exe_dir / "logs"};
   OnConfigurePaths(path_config);
   game_data_root_ = path_config.game_data_root;
   user_data_root_ = path_config.user_data_root;
@@ -156,6 +158,7 @@ bool ReXApp::SetupEnvironment() {
   cache_root_ = path_config.cache_root;
   metadata_root_ = path_config.metadata_root;
   config_path_ = path_config.config_path;
+  const std::filesystem::path log_root = path_config.log_root;
   resolved_defaults_ = std::move(path_config);
 
   // Load config FIRST so log cvars have final values
@@ -173,12 +176,12 @@ bool ReXApp::SetupEnvironment() {
                                         log_level_str, category_levels);
   if (log_file_cvar.empty()) {
     log_config.app_name = std::string(GetName());
-    log_config.log_dir = (exe_dir / "logs").string();
+    log_config.log_dir = log_root.string();
   }
 
   rex::InitLogging(log_config);
   rex::RegisterLogLevelCallback();
-  rex::crash::Install((exe_dir / "logs").string(), std::string(GetName()));
+  rex::crash::Install(log_root.string(), std::string(GetName()));
   rex::system::RegisterGuestCrashInfo();
   rex::stats::StartPeriodicLogging();
   // DP1 2026-09-14: the Tracy client is built in but was never started, and
