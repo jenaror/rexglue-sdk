@@ -30,11 +30,13 @@ namespace {
 namespace fs = std::filesystem;
 
 constexpr std::array<std::string_view, 2> kRootSuffixes = {".", "macOS"};
-constexpr std::array<std::string_view, 3> kRootMarkers = {
-    "lib/libvulkan.1.dylib", "Frameworks/vulkan.framework/vulkan", "lib/libMoltenVK.dylib"};
-constexpr std::array<std::string_view, 4> kLoaderFiles = {
-    "lib/libvulkan.1.dylib", "lib/libvulkan.dylib", "Frameworks/vulkan.framework/vulkan",
+// Frameworks/libvulkan.1.dylib: the loader in an app bundle's Contents.
+constexpr std::array<std::string_view, 4> kRootMarkers = {
+    "lib/libvulkan.1.dylib", "Frameworks/vulkan.framework/vulkan", "Frameworks/libvulkan.1.dylib",
     "lib/libMoltenVK.dylib"};
+constexpr std::array<std::string_view, 5> kLoaderFiles = {
+    "lib/libvulkan.1.dylib", "lib/libvulkan.dylib", "Frameworks/vulkan.framework/vulkan",
+    "Frameworks/libvulkan.1.dylib", "lib/libMoltenVK.dylib"};
 constexpr std::array<std::string_view, 2> kSpirvToolsFiles = {
     "lib/libSPIRV-Tools-shared.dylib", "Frameworks/libSPIRV-Tools-shared.dylib"};
 constexpr std::array<std::string_view, 3> kIcdFiles = {"share/vulkan/icd.d/MoltenVK_icd.json",
