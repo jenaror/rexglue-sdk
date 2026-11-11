@@ -48,6 +48,26 @@ class DeferredCommandBuffer {
   // draw changes nothing that is ever read, if known.
   void SetNextDrawMaxY(uint32_t max_y) { next_draw_max_y_ = max_y; }
 
+  // DP mac port: on a tile-based GPU, ending a render pass for a transfer and
+  // beginning it again stores and reloads all of its attachments.
+  // OpenPrePassSlot, called right before a render pass begins, reserves a place
+  // for transfers needed while that pass is open: buffer copies recorded
+  // between BeginRecordingBeforeRenderPass and EndRecordingBeforeRenderPass,
+  // until the pass ends, are executed there - after everything recorded before
+  // the slot, before the pass, with memory barriers on both sides. The caller
+  // must make sure nothing in the pass needs the old contents of the memory
+  // they write.
+  void OpenPrePassSlot();
+  bool IsPrePassSlotOpen() const { return pre_pass_slot_open_; }
+  void BeginRecordingBeforeRenderPass() {
+    assert_true(pre_pass_slot_open_);
+    recording_before_render_pass_ = true;
+  }
+  void EndRecordingBeforeRenderPass() {
+    recording_before_render_pass_ = false;
+    pre_pass_slots_.back().second = pre_pass_stream_.size();
+  }
+
   // render_pass_begin->pNext of all barriers must be null.
   void CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,
                             VkSubpassContents contents) {
@@ -291,6 +311,7 @@ class DeferredCommandBuffer {
 
   void CmdVkEndRenderPass() {
     FinishRenderAreaTracking();
+    pre_pass_slot_open_ = false;
     WriteCommand(Command::kVkEndRenderPass, 0);
   }
 
@@ -298,6 +319,7 @@ class DeferredCommandBuffer {
   void CmdVkBeginRendering(const VkRenderingInfo* rendering_info);
   void CmdVkEndRendering() {
     FinishRenderAreaTracking();
+    pre_pass_slot_open_ = false;
     WriteCommand(Command::kVkEndRendering, 0);
   }
 
@@ -425,6 +447,7 @@ class DeferredCommandBuffer {
     kVkSetStencilReference,
     kVkSetStencilWriteMask,
     kVkSetViewport,
+    kPrePassSlot,
   };
 
   struct CommandHeader {
@@ -621,6 +644,13 @@ class DeferredCommandBuffer {
     static_assert(alignof(VkViewport) <= alignof(uintmax_t));
   };
 
+  struct ArgsPrePassSlot {
+    size_t slot_index;
+  };
+
+  void ExecuteCommands(VkCommandBuffer command_buffer, const uintmax_t* stream,
+                       size_t stream_remaining);
+
   void* WriteCommand(Command command, size_t arguments_size_bytes);
 
   // Render area tracking (TrackRenderAreaOfLastBegin).
@@ -676,6 +706,13 @@ class DeferredCommandBuffer {
   VkViewport current_viewport_ = {};
   bool current_viewport_known_ = false;
   uint32_t next_draw_max_y_ = UINT32_MAX;
+
+  // Transfers recorded for pre-pass slots (OpenPrePassSlot), and the range of
+  // each slot in that stream, in elements.
+  std::vector<uintmax_t> pre_pass_stream_;
+  std::vector<std::pair<size_t, size_t>> pre_pass_slots_;
+  bool pre_pass_slot_open_ = false;
+  bool recording_before_render_pass_ = false;
 };
 
 }  // namespace rex::graphics::vulkan

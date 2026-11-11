@@ -76,6 +76,13 @@ REXCVAR_DEFINE_BOOL(vulkan_tight_render_area, true, "GPU/Vulkan",
                     "load and store the whole render area of every pass)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// DP mac port: see DeferredCommandBuffer::OpenPrePassSlot.
+REXCVAR_DEFINE_BOOL(vulkan_upload_before_render_pass, true, "GPU/Vulkan",
+                    "Copy shared memory uploads needed while a render target cache render pass is "
+                    "open to before that pass when none of its draws uses the memory, instead of "
+                    "ending the pass (tile-based GPUs store and reload its attachments)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics::vulkan {
 
 namespace {
@@ -3125,6 +3132,14 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
   current_framebuffer_ = framebuffer;
 
+  // DP mac port: uploads needed while this pass is open may be recorded here
+  // (CanUploadBeforeRenderPass).
+  if (REXCVAR_GET(vulkan_upload_before_render_pass)) {
+    deferred_command_buffer_.OpenPrePassSlot();
+  }
+  render_pass_shared_memory_ranges_.clear();
+  render_pass_shared_memory_all_ = false;
+
   if (use_dynamic_rendering) {
     VkRenderingAttachmentInfo color_attachments[xenos::kMaxColorRenderTargets];
     VkRenderingAttachmentInfo depth_attachment;
@@ -3203,6 +3218,14 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
   current_framebuffer_ = framebuffer;
 
+  // DP mac port: uploads needed while this pass is open may be recorded here
+  // (CanUploadBeforeRenderPass).
+  if (REXCVAR_GET(vulkan_upload_before_render_pass)) {
+    deferred_command_buffer_.OpenPrePassSlot();
+  }
+  render_pass_shared_memory_ranges_.clear();
+  render_pass_shared_memory_all_ = false;
+
   if (use_dynamic_rendering) {
     VkRenderingAttachmentInfo color_attachment = {};
     VkRenderingAttachmentInfo depth_attachment = {};
@@ -3280,6 +3303,37 @@ void VulkanCommandProcessor::EndRenderPass() {
   current_render_pass_ = VK_NULL_HANDLE;
   current_framebuffer_ = nullptr;
   in_render_pass_ = false;
+}
+
+bool VulkanCommandProcessor::CanUploadBeforeRenderPass(uint32_t start, uint32_t length) const {
+  if (!in_render_pass_ || !deferred_command_buffer_.IsPrePassSlotOpen() ||
+      render_pass_shared_memory_all_ || !REXCVAR_GET(vulkan_upload_before_render_pass)) {
+    return false;
+  }
+  uint32_t end = uint32_t(std::min(uint64_t(start) + length, uint64_t(UINT32_MAX)));
+  for (const auto& [range_start, range_end] : render_pass_shared_memory_ranges_) {
+    if (range_start < end && start < range_end) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void VulkanCommandProcessor::NoteRenderPassSharedMemoryRange(uint32_t start, uint32_t length) {
+  if (!length) {
+    return;
+  }
+  uint32_t end = uint32_t(std::min(uint64_t(start) + length, uint64_t(UINT32_MAX)));
+  // Consecutive draws often use adjacent or the same memory.
+  if (!render_pass_shared_memory_ranges_.empty()) {
+    std::pair<uint32_t, uint32_t>& last = render_pass_shared_memory_ranges_.back();
+    if (start <= last.second && last.first <= end) {
+      last.first = std::min(last.first, start);
+      last.second = std::max(last.second, end);
+      return;
+    }
+  }
+  render_pass_shared_memory_ranges_.emplace_back(start, end);
 }
 
 VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(
@@ -3610,6 +3664,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   const RegisterFile& regs = *register_file_;
   (void)index_buffer_info;
+  draw_shared_memory_ranges_.clear();
+  draw_shared_memory_all_ = false;
   auto draw_fail = [&](const char* stage) {
     auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
     REXGPU_ERROR(
@@ -3728,6 +3784,18 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     if (!primitive_processing_result.host_draw_vertex_count) {
       // Nothing to draw.
       return true;
+    }
+    // DP mac port: guest indices read from the shared memory, for
+    // CanUploadBeforeRenderPass (an upper bound of their size).
+    if (primitive_processing_result.index_buffer_type ==
+            PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA ||
+        primitive_processing_result.index_buffer_type ==
+            PrimitiveProcessor::ProcessedIndexBufferType::kHostBuiltinForDMA) {
+      draw_shared_memory_ranges_.emplace_back(
+          primitive_processing_result.guest_index_base,
+          std::max(primitive_processing_result.guest_draw_vertex_count,
+                   primitive_processing_result.host_draw_vertex_count) *
+              uint32_t(sizeof(uint32_t)));
     }
     if (primitive_processing_result.host_primitive_type == xenos::PrimitiveType::kTriangleFan) {
       // Vulkan uses the same fan-to-list conversion policy as D3D12.
@@ -4001,6 +4069,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       uint32_t vfetch_index = i * 32 + j;
       uint64_t vfetch_bit = uint64_t(1) << (vfetch_index & 63);
       if (vertex_buffers_in_sync_[vfetch_index >> 6] & vfetch_bit) {
+        const VertexBufferState& state_in_sync = vertex_buffer_states_[vfetch_index];
+        draw_shared_memory_ranges_.emplace_back(state_in_sync.address << 2,
+                                                state_in_sync.size << 2);
         continue;
       }
       xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(vfetch_index);
@@ -4023,6 +4094,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                       vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
           return false;
       }
+      draw_shared_memory_ranges_.emplace_back(vfetch_constant.address << 2,
+                                              vfetch_constant.size << 2);
       VertexBufferState& state = vertex_buffer_states_[vfetch_index];
       if (state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
         vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
@@ -4053,11 +4126,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
           memexport_range_base_bytes, memexport_range.size_bytes);
       return false;
     }
+    draw_shared_memory_ranges_.emplace_back(memexport_range_base_bytes, memexport_range.size_bytes);
     memexport_extent_start = std::min(memexport_extent_start, memexport_range_base_bytes);
     memexport_extent_end =
         std::max(memexport_extent_end, memexport_range_base_bytes + memexport_range.size_bytes);
   }
   if (memexport_writes_possible && memexport_ranges_.empty()) {
+    draw_shared_memory_all_ = true;
     if (!shared_memory_->RequestRange(0, SharedMemory::kBufferSize)) {
       REXGPU_ERROR(
           "Failed to request full shared memory residency for unresolved "
@@ -4173,6 +4248,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
             : VK_INDEX_TYPE_UINT32);
     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
                                               0, 0, 0);
+  }
+
+  // DP mac port: what the draw accesses must not change under it.
+  render_pass_shared_memory_all_ = render_pass_shared_memory_all_ || draw_shared_memory_all_;
+  for (const std::pair<uint32_t, uint32_t>& range : draw_shared_memory_ranges_) {
+    NoteRenderPassSharedMemoryRange(range.first, range.second);
   }
 
   // Invalidate textures in memexported memory and watch for changes.

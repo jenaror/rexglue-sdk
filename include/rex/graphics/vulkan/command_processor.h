@@ -204,6 +204,12 @@ class VulkanCommandProcessor : public CommandProcessor {
   // scope. Submission must be open.
   void EndRenderPass();
 
+  // DP mac port: whether a shared memory upload of the byte range can be
+  // recorded before the render target cache render pass that is open
+  // (DeferredCommandBuffer::OpenPrePassSlot) instead of ending it - when no draw
+  // in the pass reads or writes the range.
+  bool CanUploadBeforeRenderPass(uint32_t start, uint32_t length) const;
+
   VkDescriptorSetLayout GetSingleTransientDescriptorLayout(
       SingleTransientDescriptorLayout transient_descriptor_layout) const {
     return descriptor_set_layouts_single_transient_[size_t(transient_descriptor_layout)];
@@ -839,6 +845,15 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   // Temporary storage for memexport stream constants used in the draw.
   std::vector<draw_util::MemExportRange> memexport_ranges_;
+
+  // DP mac port: shared memory byte ranges [start, end) accessed by the draws
+  // in the open render target cache render pass, for CanUploadBeforeRenderPass,
+  // or all of it. The draw being set up collects its own first.
+  void NoteRenderPassSharedMemoryRange(uint32_t start, uint32_t length);
+  std::vector<std::pair<uint32_t, uint32_t>> render_pass_shared_memory_ranges_;
+  bool render_pass_shared_memory_all_ = false;
+  std::vector<std::pair<uint32_t, uint32_t>> draw_shared_memory_ranges_;
+  bool draw_shared_memory_all_ = false;
 };
 
 }  // namespace rex::graphics::vulkan

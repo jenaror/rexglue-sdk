@@ -275,13 +275,23 @@ bool VulkanSharedMemory::UploadRanges(
   }
   // upload_page_ranges are sorted, use them to determine the range for the
   // ordering barrier.
-  Use(Usage::kTransferDestination,
-      std::make_pair(upload_page_ranges.front().first << page_size_log2(),
-                     (upload_page_ranges.back().first + upload_page_ranges.back().second -
-                      upload_page_ranges.front().first)
-                         << page_size_log2()));
-  command_processor_.SubmitBarriers(true);
+  std::pair<uint32_t, uint32_t> upload_extent_bytes(
+      upload_page_ranges.front().first << page_size_log2(),
+      (upload_page_ranges.back().first + upload_page_ranges.back().second -
+       upload_page_ranges.front().first)
+          << page_size_log2());
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+  // DP mac port: ending the render pass for every upload is expensive on
+  // tile-based GPUs - if no draw in the open pass uses this memory, copy it
+  // before the pass instead.
+  bool before_render_pass = command_processor_.CanUploadBeforeRenderPass(
+      upload_extent_bytes.first, upload_extent_bytes.second);
+  if (before_render_pass) {
+    command_buffer.BeginRecordingBeforeRenderPass();
+  } else {
+    Use(Usage::kTransferDestination, upload_extent_bytes);
+    command_processor_.SubmitBarriers(true);
+  }
   uint64_t submission_current = command_processor_.GetCurrentSubmission();
   bool successful = true;
   upload_regions_.clear();
@@ -328,6 +338,9 @@ bool VulkanSharedMemory::UploadRanges(
     command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
                                    uint32_t(upload_regions_.size()), upload_regions_.data());
     upload_regions_.clear();
+  }
+  if (before_render_pass) {
+    command_buffer.EndRecordingBeforeRenderPass();
   }
   return successful;
 }

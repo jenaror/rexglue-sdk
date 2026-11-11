@@ -36,6 +36,19 @@ void DeferredCommandBuffer::Reset() {
   current_scissor_known_ = false;
   current_viewport_known_ = false;
   next_draw_max_y_ = UINT32_MAX;
+  pre_pass_stream_.clear();
+  pre_pass_slots_.clear();
+  pre_pass_slot_open_ = false;
+  recording_before_render_pass_ = false;
+}
+
+void DeferredCommandBuffer::OpenPrePassSlot() {
+  assert_false(recording_before_render_pass_);
+  auto& args = *reinterpret_cast<ArgsPrePassSlot*>(
+      WriteCommand(Command::kPrePassSlot, sizeof(ArgsPrePassSlot)));
+  args.slot_index = pre_pass_slots_.size();
+  pre_pass_slots_.emplace_back(pre_pass_stream_.size(), pre_pass_stream_.size());
+  pre_pass_slot_open_ = true;
 }
 
 void DeferredCommandBuffer::TrackRenderAreaOfLastBegin() {
@@ -86,10 +99,13 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+  ExecuteCommands(command_buffer, command_stream_.data(), command_stream_.size());
+}
+
+void DeferredCommandBuffer::ExecuteCommands(VkCommandBuffer command_buffer, const uintmax_t* stream,
+                                            size_t stream_remaining) {
   const ui::vulkan::VulkanDevice::Functions& dfn =
       command_processor_.GetVulkanDevice()->functions();
-  const uintmax_t* stream = command_stream_.data();
-  size_t stream_remaining = command_stream_.size();
   while (stream_remaining) {
     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
     stream += kCommandHeaderSizeElements;
@@ -363,6 +379,30 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                                  rex::align(sizeof(ArgsVkSetViewport), alignof(VkViewport))));
       } break;
 
+      case Command::kPrePassSlot: {
+        auto& args = *reinterpret_cast<const ArgsPrePassSlot*>(stream);
+        const std::pair<size_t, size_t>& slot = pre_pass_slots_[args.slot_index];
+        if (slot.second > slot.first) {
+          // After everything before, and everything after, including the
+          // render pass, after the transfers.
+          VkMemoryBarrier memory_barrier;
+          memory_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+          memory_barrier.pNext = nullptr;
+          memory_barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+          memory_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+          dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &memory_barrier, 0,
+                                   nullptr, 0, nullptr);
+          ExecuteCommands(command_buffer, pre_pass_stream_.data() + slot.first,
+                          slot.second - slot.first);
+          memory_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+          memory_barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+          dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &memory_barrier, 0,
+                                   nullptr, 0, nullptr);
+        }
+      } break;
+
       default:
         assert_unhandled_case(header.command);
         break;
@@ -466,14 +506,19 @@ void DeferredCommandBuffer::CmdVkBeginRendering(const VkRenderingInfo* rendering
 }
 
 void* DeferredCommandBuffer::WriteCommand(Command command, size_t arguments_size_bytes) {
+  // Only buffer copies may be moved before a render pass (the stream offsets
+  // kept for the render area tracking are in command_stream_).
+  assert_true(!recording_before_render_pass_ || command == Command::kVkCopyBuffer);
+  std::vector<uintmax_t>& stream =
+      recording_before_render_pass_ ? pre_pass_stream_ : command_stream_;
   size_t arguments_size_elements =
       (arguments_size_bytes + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
-  size_t offset = command_stream_.size();
-  command_stream_.resize(offset + kCommandHeaderSizeElements + arguments_size_elements);
-  CommandHeader& header = *reinterpret_cast<CommandHeader*>(command_stream_.data() + offset);
+  size_t offset = stream.size();
+  stream.resize(offset + kCommandHeaderSizeElements + arguments_size_elements);
+  CommandHeader& header = *reinterpret_cast<CommandHeader*>(stream.data() + offset);
   header.command = command;
   header.arguments_size_elements = uint32_t(arguments_size_elements);
-  return command_stream_.data() + (offset + kCommandHeaderSizeElements);
+  return stream.data() + (offset + kCommandHeaderSizeElements);
 }
 
 }  // namespace rex::graphics::vulkan
